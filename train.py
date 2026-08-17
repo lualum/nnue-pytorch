@@ -270,7 +270,10 @@ def main():
         )
         print("Loss parameters:")
         print(args.nnue_lightning_config.loss_params)
-        print(f"Feature set: {feature_name}")
+        print(f"Network type: {nnue.model.network_type}")
+        print(f"Configured feature set: {feature_name}")
+        if nnue.model.feature_name != feature_name:
+            print(f"Effective feature set: {nnue.model.feature_name}")
         print(f"Num inputs: {nnue.model.input.NUM_INPUTS}")
 
         print(f"Training with: {train_datasets}")

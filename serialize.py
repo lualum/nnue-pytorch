@@ -66,7 +66,7 @@ class CliConfig:
     """Source file (can be .ckpt, .pt or .nnue)"""
 
     target: Positional[str]
-    """Target file (can be .pt or .nnue)"""
+    """Target file (can be .pt, .nnue, or movement .mnnue)"""
     serialize_config: OmitArgPrefixes[SerializeConfig] = field(
         default_factory=SerializeConfig
     )
@@ -85,6 +85,7 @@ def main():
 
     # Treat --out-sha as targeting .nnue even if target doesn't end with .nnue
     target_is_nnue = serialize_config.out_sha or args.target.endswith(".nnue")
+    target_is_mnnue = args.target.endswith(".mnnue")
 
     model_description = serialize_config.description
     ft_compression = serialize_config.ft_compression
@@ -165,6 +166,11 @@ def main():
         raise ValueError("Cannot convert into .ckpt")
     elif args.target.endswith(".pt"):
         torch.save(nnue, args.target)
+    elif target_is_mnnue:
+        writer = M.MovementNNUEWriter(nnue.model, model_description)
+        with open(args.target, "wb") as f:
+            f.write(writer.buf)
+        print(f"Wrote {args.target}")
     elif target_is_nnue:
         if os.path.isdir(args.target):
             out_dir = os.path.abspath(args.target)

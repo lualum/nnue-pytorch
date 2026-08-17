@@ -111,6 +111,12 @@ class NNUEWriter:
         ft_compression: str = "none",
         verbose: bool = True,
     ):
+        if model.network_type != "nnue":
+            raise ValueError(
+                "The legacy .nnue format cannot encode movement graphs. Save the "
+                "movement model as .pt and use the runtime layout documented in "
+                "docs/movement_nnue.md."
+            )
         if description is None:
             description = DEFAULT_DESCRIPTION
 
@@ -251,6 +257,8 @@ class NNUEReader:
         feature_name: str,
         config: ModelConfig,
     ):
+        if config.network_type != "nnue":
+            raise ValueError("Legacy .nnue files require --network-type nnue.")
         self.f = f
         self.feature_name = feature_name
         self.model = NNUEModel(feature_name, config)

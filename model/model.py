@@ -2,11 +2,23 @@ import torch
 from torch import nn
 
 from .config import ModelConfig
-from .modules import ComposedFeatureTransformer, LayerStacks, get_feature_cls
+from .modules import (
+    ComposedFeatureTransformer,
+    DualMovementAccumulator,
+    LayerStacks,
+    MovementEvaluationNetwork,
+    MovementFeatureDecoder,
+    get_feature_cls,
+)
+from .modules.features.halfka_v2_hm import HalfKav2Hm
 from .quantize import QuantizationManager
 
 
 class NNUEModel(nn.Module):
+    # Keeps older pickled .pt models, which predate this instance attribute,
+    # on the conventional evaluator path.
+    network_type = "nnue"
+
     def __init__(
         self,
         feature_name: str,
@@ -16,7 +28,7 @@ class NNUEModel(nn.Module):
     ):
         super().__init__()
 
-        feature_cls = get_feature_cls(feature_name)
+        self.network_type = config.network_type
         self.L1 = config.L1
         self.L2 = config.L2
         self.L3 = config.L3
@@ -27,16 +39,42 @@ class NNUEModel(nn.Module):
         self.num_psqt_buckets = num_psqt_buckets
         self.num_ls_buckets = num_ls_buckets
 
-        self.input = ComposedFeatureTransformer(feature_cls, self.L1, self.num_psqt_buckets, self.quantization)
+        if self.network_type == "movement":
+            configured_features = get_feature_cls(feature_name)
+            if sum(fc is HalfKav2Hm for fc in configured_features) != 1:
+                raise ValueError(
+                    "Movement networks require a HalfKAv2_hm^ feature component."
+                )
+            # Other configured feature components are redundant: movement
+            # relationships replace threat/pawn-pair tables.  Asking the native
+            # loader for HalfKA alone avoids extracting and transferring them.
+            self.input = MovementFeatureDecoder(HalfKav2Hm.FEATURE_NAME)
+            self.movement = MovementEvaluationNetwork(
+                dim=config.movement_dim,
+                iterations=config.movement_iterations,
+            )
+            self.layer_stacks = None
+            self.weight_clipping = []
+        else:
+            feature_cls = get_feature_cls(feature_name)
+            self.input = ComposedFeatureTransformer(
+                feature_cls,
+                self.L1,
+                self.num_psqt_buckets,
+                self.quantization,
+            )
+            self.movement = None
+            self.layer_stacks = LayerStacks(
+                self.num_ls_buckets, config, self.quantization
+            )
+            self.weight_clipping = self.quantization.generate_weight_clipping_config(
+                self
+            )
+            self.input.init_weights()
+
         self.feature_name = self.input.FEATURE_NAME
         self.input_feature_name = self.input.INPUT_FEATURE_NAME
         self.feature_hash = self.input.HASH
-        self.layer_stacks = LayerStacks(self.num_ls_buckets, config, self.quantization)
-
-        self.weight_clipping = self.quantization.generate_weight_clipping_config(self)
-
-        self.input.init_weights()
-
 
     @torch.no_grad()
     def clip_weights(self, include_input):
@@ -74,7 +112,8 @@ class NNUEModel(nn.Module):
     @torch.no_grad()
     def zero_virtual_weights(self) -> None:
         self.input.zero_virtual_weights()
-        self.layer_stacks.zero_virtual_weights()
+        if self.layer_stacks is not None:
+            self.layer_stacks.zero_virtual_weights()
 
 
     def forward_ft(
@@ -87,6 +126,8 @@ class NNUEModel(nn.Module):
         fake_quantize_acts: bool,
         fake_quantize_weights: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.network_type == "movement":
+            raise RuntimeError("Movement networks do not use a feature transformer.")
         return self.input(
             us,
             them,
@@ -114,6 +155,11 @@ class NNUEModel(nn.Module):
         fake_quantize_acts: bool=True,
         fake_quantize_weights: bool=True,
     ):
+        if self.network_type == "movement":
+            _ = them, piece_count, fake_quantize_acts, fake_quantize_weights
+            board = self.input.decode(us, white_indices, black_indices)
+            return self.movement(board)
+
         psqt_indices, layer_stack_indices = self.calculate_buckets(piece_count)
 
         l0_, wpsqt, bpsqt = self.forward_ft(
@@ -131,3 +177,60 @@ class NNUEModel(nn.Module):
         x = self.layer_stacks(l0_, layer_stack_indices, fake_quantize_acts, fake_quantize_weights) + (wpsqt - bpsqt) * (us - 0.5)
 
         return x
+
+    def forward_board(self, board: torch.Tensor) -> torch.Tensor:
+        """Evaluate side-to-move-normalized piece codes directly."""
+        if self.movement is None:
+            raise RuntimeError("forward_board is available only for movement networks.")
+        return self.movement(board)
+
+    @torch.no_grad()
+    def create_movement_accumulator(
+        self,
+        us: torch.Tensor,
+        white_indices: torch.Tensor,
+        black_indices: torch.Tensor,
+    ) -> DualMovementAccumulator:
+        if self.movement is None:
+            raise RuntimeError("Incremental state is available only for movement networks.")
+        white_board = self.input.decode(
+            torch.ones_like(us), white_indices, black_indices
+        )
+        black_board = self.input.decode(
+            torch.zeros_like(us), white_indices, black_indices
+        )
+        white = self.movement.create_accumulator(white_board)
+        black = self.movement.create_accumulator(black_board)
+        white_to_move = bool((us[0, 0] >= 0.5).item())
+        return DualMovementAccumulator(
+            white=white,
+            black=black,
+            white_to_move=white_to_move,
+            evaluation=white.evaluation if white_to_move else black.evaluation,
+        )
+
+    @torch.no_grad()
+    def update_movement_accumulator(
+        self,
+        accumulator: DualMovementAccumulator,
+        us: torch.Tensor,
+        white_indices: torch.Tensor,
+        black_indices: torch.Tensor,
+    ) -> DualMovementAccumulator:
+        if self.movement is None:
+            raise RuntimeError("Incremental state is available only for movement networks.")
+        white_board = self.input.decode(
+            torch.ones_like(us), white_indices, black_indices
+        )
+        black_board = self.input.decode(
+            torch.zeros_like(us), white_indices, black_indices
+        )
+        white = self.movement.update_accumulator(accumulator.white, white_board)
+        black = self.movement.update_accumulator(accumulator.black, black_board)
+        white_to_move = bool((us[0, 0] >= 0.5).item())
+        return DualMovementAccumulator(
+            white=white,
+            black=black,
+            white_to_move=white_to_move,
+            evaluation=white.evaluation if white_to_move else black.evaluation,
+        )

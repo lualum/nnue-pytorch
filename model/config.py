@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Annotated
+from typing import Annotated, Literal
 
 import tyro
 from tyro.conf import OmitArgPrefixes
@@ -26,16 +26,48 @@ class ModelConfig(LayerStacksConfig):
             type=int,
             default=ModelConfig.L2,
         )
+        parser.add_argument(
+            "--network-type",
+            choices=("nnue", "movement"),
+            default=ModelConfig.network_type,
+        )
+        parser.add_argument(
+            "--movement-dim", type=int, default=ModelConfig.movement_dim
+        )
+        parser.add_argument(
+            "--movement-iterations",
+            type=int,
+            default=ModelConfig.movement_iterations,
+        )
 
     @staticmethod
     def get_model_config(args) -> "ModelConfig":
         config = ModelConfig()
         config.L1 = args.L1
         config.L2 = args.L2
+        config.network_type = args.network_type
+        config.movement_dim = args.movement_dim
+        config.movement_iterations = args.movement_iterations
+        config.__post_init__()
         return config
 
     # Not omitting prefix on purpose.
     quantize_config: QuantizationConfig = field(default_factory=QuantizationConfig)
+
+    network_type: Literal["nnue", "movement"] = "nnue"
+    """Evaluator implementation. ``movement`` enables the iterative square network."""
+
+    movement_dim: int = 8
+    """Learned values per square in the movement evaluator."""
+
+    movement_iterations: int = 3
+    """Number of shared-weight message/update iterations (must be 3 through 5)."""
+
+    def __post_init__(self) -> None:
+        if self.movement_dim < 4:
+            raise ValueError("movement_dim must be at least 4.")
+        if not 3 <= self.movement_iterations <= 5:
+            raise ValueError("movement_iterations must be between 3 and 5.")
 
 
 @dataclass(kw_only=True)

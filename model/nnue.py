@@ -118,6 +118,24 @@ class NNUE(nn.Module):
         optimizer_config = self.config.optimizer_config
         self.optimizer_wrapper = optimizer_config.get_optimizer_wrapper()
 
+        if self.model.network_type == "movement":
+            # The iterative evaluator is intentionally tiny; embeddings and
+            # message/update/readout matrices share the dense decay setting.
+            movement = self.model.movement
+            train_params = [
+                {
+                    "params": _get_parameters([movement], get_biases=False),
+                    "lr": optimizer_config.lr,
+                    "weight_decay": optimizer_config.dense_weight_decay,
+                },
+                {
+                    "params": _get_parameters([movement], get_biases=True),
+                    "lr": optimizer_config.lr,
+                    "weight_decay": 0.0,
+                },
+            ]
+            return self.optimizer_wrapper.configure_optimizers(train_params)
+
         LRs = [optimizer_config.lr] * 10
 
         ft_wd = optimizer_config.ft_weight_decay
