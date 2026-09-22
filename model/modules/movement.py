@@ -1,8 +1,8 @@
 """Tiny movement-geometry message passing evaluator.
 
-The module deliberately uses edge lists and directional ray scans instead of a
-64 x 64 attention tensor.  Piece locations are decoded from the HalfKAv2_hm
-component already produced by the training data loader.
+The module uses sparse edge lists rather than a 64 x 64 attention tensor.
+Sliding-piece relations are generated directly for every source/target pair;
+they do not depend on a sequential ray scan.
 """
 
 from dataclasses import dataclass
@@ -82,28 +82,47 @@ def _make_double_pawn_edges(
     return sources, middles, destinations
 
 
-def _make_ray_lines(file_delta: int, rank_delta: int) -> torch.Tensor:
-    """Return directional board lines as [depth, line], padded with -1."""
-    starts: list[tuple[int, int]] = []
-    for rank in range(8):
-        for file in range(8):
-            if not _inside(file - file_delta, rank - rank_delta):
-                starts.append((file, rank))
+def _make_ray_pairs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return all directed slider relations and their intervening squares.
 
-    lines: list[list[int]] = []
-    for start_file, start_rank in starts:
-        line: list[int] = []
-        file, rank = start_file, start_rank
-        while _inside(file, rank):
-            line.append(_square(file, rank))
-            file += file_delta
-            rank += rank_delta
-        lines.append(line)
-
-    result = torch.full((8, len(lines)), -1, dtype=torch.long)
-    for line_index, line in enumerate(lines):
-        result[: len(line), line_index] = torch.tensor(line)
-    return result
+    ``paths[e]`` contains only squares strictly between a relation's source and
+    target, in board order.  Each relation can therefore expose x-rays in one
+    message-passing layer: a rook and a queen separated by a pawn are connected
+    directly, while the pawn is included as the first blocker context.
+    """
+    sources: list[int] = []
+    destinations: list[int] = []
+    directions: list[int] = []
+    distances: list[int] = []
+    paths: list[list[int]] = []
+    for source_rank in range(8):
+        for source_file in range(8):
+            source = _square(source_file, source_rank)
+            for direction, (file_delta, rank_delta) in enumerate(_RAY_DIRECTIONS):
+                path: list[int] = []
+                file, rank = source_file + file_delta, source_rank + rank_delta
+                distance = 1
+                while _inside(file, rank):
+                    sources.append(source)
+                    destinations.append(_square(file, rank))
+                    directions.append(direction)
+                    distances.append(distance)
+                    paths.append(path.copy())
+                    path.append(_square(file, rank))
+                    file += file_delta
+                    rank += rank_delta
+                    distance += 1
+    padded = torch.full((len(paths), 6), -1, dtype=torch.long)
+    for index, path in enumerate(paths):
+        if path:
+            padded[index, : len(path)] = torch.tensor(path)
+    return (
+        torch.tensor(sources),
+        torch.tensor(destinations),
+        torch.tensor(directions),
+        torch.tensor(distances),
+        padded,
+    )
 
 
 def _feature_hash(feature_classes: list[type]) -> int:
@@ -255,7 +274,8 @@ class DualMovementAccumulator:
 class MovementEvaluationNetwork(nn.Module):
     """Small shared-weight graph network over chess movement relationships."""
 
-    # Old pickled networks predate this option.
+    # Kept only so already-created configs and checkpoints can be loaded. Rays
+    # are direct relations in every current model.
     ordered_rays = False
 
     def __init__(self, dim: int = 8, iterations: int = 3, ordered_rays: bool = False):
@@ -275,13 +295,12 @@ class MovementEvaluationNetwork(nn.Module):
         self.pawn_diagonal_message = nn.Linear(dim, dim)
         self.pawn_forward_message = nn.Linear(dim, dim)
         self.ray_message = nn.Linear(dim, dim)
-
-        # Ordered movement paths share this learned state-dependent transition.
-        # It is linear in the carried message, preserving additive contributions.
-        self.path_gate = nn.Linear(dim, dim)
-        self.path_scale = nn.Parameter(torch.zeros(dim))
-        if ordered_rays:
-            self.path_mix = nn.Parameter(torch.zeros(dim, dim))
+        self.ray_target = nn.Linear(dim, dim, bias=False)
+        self.ray_first_blocker = nn.Linear(dim, dim, bias=False)
+        self.ray_second_blocker = nn.Linear(dim, dim, bias=False)
+        self.ray_direction = nn.Embedding(len(_RAY_DIRECTIONS), dim)
+        self.ray_distance = nn.Embedding(8, dim)
+        self.ray_blocker_count = nn.Embedding(4, dim)
         self.update = MovementUpdate(dim)
 
         self.readout_hidden = nn.Linear(dim, dim)
@@ -321,12 +340,12 @@ class MovementEvaluationNetwork(nn.Module):
                 f"_{name}_destinations", destinations, persistent=False
             )
 
-        for direction_index, (file_delta, rank_delta) in enumerate(_RAY_DIRECTIONS):
-            self.register_buffer(
-                f"_ray_lines_{direction_index}",
-                _make_ray_lines(file_delta, rank_delta),
-                persistent=False,
-            )
+        sources, destinations, directions, distances, paths = _make_ray_pairs()
+        self.register_buffer("_ray_sources", sources, persistent=False)
+        self.register_buffer("_ray_destinations", destinations, persistent=False)
+        self.register_buffer("_ray_directions", directions, persistent=False)
+        self.register_buffer("_ray_distances", distances, persistent=False)
+        self.register_buffer("_ray_paths", paths, persistent=False)
 
     @staticmethod
     def _make_dirty_dependents() -> tuple[tuple[int, ...], ...]:
@@ -346,8 +365,8 @@ class MovementEvaluationNetwork(nn.Module):
                 to_file, to_rank = file + file_delta, rank + rank_delta
                 if _inside(to_file, to_rank):
                     dependents[source].add(_square(to_file, to_rank))
-            # Every state on an ordered ray can transform a carried message, so
-            # every square sharing one of its four lines is conservatively dirty.
+            # A changed square can be source, target or blocker for every ray
+            # relation sharing one of its ranks, files or diagonals.
             for file_delta, rank_delta in _RAY_DIRECTIONS:
                 to_file, to_rank = file + file_delta, rank + rank_delta
                 while _inside(to_file, to_rank):
@@ -364,9 +383,8 @@ class MovementEvaluationNetwork(nn.Module):
                 nn.init.xavier_uniform_(layer.weight)
                 if layer.bias is not None:
                     nn.init.zeros_(layer.bias)
-        # Begin with cautious recurrent changes and mostly transmitting paths.
+        # Begin with cautious recurrent changes.
         nn.init.constant_(self.update.self_gate.bias, -1.0)
-        nn.init.constant_(self.path_gate.bias, -2.0)
         nn.init.zeros_(self.readout.bias)
 
     @staticmethod
@@ -387,61 +405,70 @@ class MovementEvaluationNetwork(nn.Module):
         mask = source_mask.index_select(1, sources)
         return values * mask.unsqueeze(-1), destinations
 
-    def _path_factors(self, square_state: torch.Tensor) -> torch.Tensor:
-        gate = torch.clamp(0.2 * self.path_gate(square_state) + 0.5, 0.0, 1.0)
-        scale = torch.clamp(self.path_scale, -1.0, 1.0)
-        return 1.0 + gate * (scale - 1.0)
-
-    def _path_transition(
-        self, carrier: torch.Tensor, factors: torch.Tensor
-    ) -> torch.Tensor:
-        """Order-sensitive, nonexpansive transition, linear in the carrier.
-
-        Independent channel factors commute. Adding a shared channel mixer
-        allows intervening states to transform a ray differently in each order.
-        Row L1 normalization bounds the mixer in the infinity norm; allocating
-        only 1 - abs(factor) to mixing bounds the entire transition by one.
-        Zero initialization reproduces the diagonal baseline exactly.
-        """
-        result = carrier * factors
-        if self.ordered_rays:
-            weight = self.path_mix / self.path_mix.abs().sum(
-                dim=1, keepdim=True
-            ).clamp_min(1.0)
-            mixed = torch.nn.functional.linear(carrier, weight)
-            result = result + (1.0 - factors.abs()) * mixed
-        return result
-
     def _ray_values(
         self,
-        path_factors: torch.Tensor,
-        projected: torch.Tensor,
-        slider_mask: torch.Tensor,
-        lines: torch.Tensor,
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-        batch_size = path_factors.shape[0]
-        line_count = lines.shape[1]
-        carrier = path_factors.new_zeros(batch_size, line_count, self.dim)
-        values: list[torch.Tensor] = []
-        destinations: list[torch.Tensor] = []
+        hidden: torch.Tensor,
+        board: torch.Tensor,
+        orthogonal_mask: torch.Tensor,
+        diagonal_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Evaluate every slider-to-square ray relation in parallel.
 
-        for depth in range(lines.shape[0]):
-            square_indices = lines[depth]
-            valid = square_indices >= 0
-            safe_indices = square_indices.clamp_min(0)
-            valid_values = valid.view(1, -1, 1)
+        A relation receives the source and target state, the first two occupied
+        squares strictly between them, direction, distance, and a clipped
+        blocker count. ``min`` reductions select blockers from fixed path
+        tensors, rather than carrying a message through one square at a time.
+        """
+        paths = self._ray_paths
+        safe_paths = paths.clamp_min(0)
+        path_valid = paths.ge(0).view(1, -1, paths.shape[1])
+        path_codes = board.index_select(1, safe_paths.flatten()).view(
+            board.shape[0], paths.shape[0], paths.shape[1]
+        )
+        occupied = path_valid & path_codes.ne(EMPTY)
+        positions = torch.arange(paths.shape[1], device=board.device).view(1, 1, -1)
+        absent = torch.full_like(positions, paths.shape[1])
+        first_position = torch.where(occupied, positions, absent).amin(dim=-1)
+        first_exists = first_position.lt(paths.shape[1])
+        second_occupied = occupied & positions.gt(first_position.unsqueeze(-1))
+        second_position = torch.where(second_occupied, positions, absent).amin(dim=-1)
+        second_exists = second_position.lt(paths.shape[1])
 
-            # Every square receives the current carrier. Its learned state then
-            # transforms the carrier before any message originating here is added.
-            values.append(carrier * valid_values)
-            destinations.append(safe_indices)
+        expanded_paths = safe_paths.unsqueeze(0).expand(board.shape[0], -1, -1)
+        first_squares = expanded_paths.gather(
+            2, first_position.clamp_max(paths.shape[1] - 1).unsqueeze(-1)
+        ).squeeze(-1)
+        second_squares = expanded_paths.gather(
+            2, second_position.clamp_max(paths.shape[1] - 1).unsqueeze(-1)
+        ).squeeze(-1)
+        source = hidden.index_select(1, self._ray_sources)
+        target = hidden.index_select(1, self._ray_destinations)
+        first = hidden.gather(
+            1, first_squares.unsqueeze(-1).expand(-1, -1, self.dim)
+        )
+        second = hidden.gather(
+            1, second_squares.unsqueeze(-1).expand(-1, -1, self.dim)
+        )
+        first = first * first_exists.unsqueeze(-1)
+        second = second * second_exists.unsqueeze(-1)
+        blocker_count = occupied.sum(dim=-1).clamp_max(3)
 
-            current_factors = path_factors.index_select(1, safe_indices)
-            is_slider = slider_mask.index_select(1, safe_indices) & valid.view(1, -1)
-            seed = projected.index_select(1, safe_indices) * is_slider.unsqueeze(-1)
-            carrier = (self._path_transition(carrier, current_factors) + seed) * valid_values
-
-        return values, destinations
+        values = (
+            self.ray_message(source)
+            + self.ray_target(target)
+            + self.ray_first_blocker(first)
+            + self.ray_second_blocker(second)
+            + self.ray_direction(self._ray_directions).unsqueeze(0)
+            + self.ray_distance(self._ray_distances).unsqueeze(0)
+            + self.ray_blocker_count(blocker_count)
+        )
+        orthogonal_relation = self._ray_directions < len(_ORTHOGONAL_DIRECTIONS)
+        source_active = torch.where(
+            orthogonal_relation.unsqueeze(0),
+            orthogonal_mask.index_select(1, self._ray_sources),
+            diagonal_mask.index_select(1, self._ray_sources),
+        )
+        return values * source_active.unsqueeze(-1)
 
     def aggregate_messages(
         self, hidden: torch.Tensor, board: torch.Tensor
@@ -467,7 +494,6 @@ class MovementEvaluationNetwork(nn.Module):
         king_projected = self.king_message(hidden)
         pawn_diagonal_projected = self.pawn_diagonal_message(hidden)
         pawn_forward_projected = self.pawn_forward_message(hidden)
-        path_factors = self._path_factors(hidden)
         edge_specs = (
             (knight_projected, knight_mask, "knight"),
             (king_projected, king_mask, "king"),
@@ -514,23 +540,16 @@ class MovementEvaluationNetwork(nn.Module):
                 sources,
                 edge_destinations,
             )
-            edge_values = self._path_transition(
-                edge_values, path_factors.index_select(1, middles)
+            edge_values = edge_values + self.ray_first_blocker(
+                hidden.index_select(1, middles)
             )
             messages.index_add_(1, edge_destinations, edge_values)
 
-        ray_projected = self.ray_message(hidden)
-        for direction_index in range(len(_RAY_DIRECTIONS)):
-            orthogonal = direction_index < len(_ORTHOGONAL_DIRECTIONS)
-            ray_values, ray_destinations = self._ray_values(
-                path_factors,
-                ray_projected,
-                orthogonal_mask if orthogonal else diagonal_mask,
-                getattr(self, f"_ray_lines_{direction_index}"),
-            )
-            messages.index_add_(
-                1, torch.cat(ray_destinations), torch.cat(ray_values, dim=1)
-            )
+        messages.index_add_(
+            1,
+            self._ray_destinations,
+            self._ray_values(hidden, board, orthogonal_mask, diagonal_mask),
+        )
 
         return messages
 
