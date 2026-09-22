@@ -1,7 +1,7 @@
 # Movement-based iterative evaluator
 
-For an optional order-sensitive path transition and a paired training protocol,
-see [Ordered-ray mixing experiment](ordered_rays.md).
+For the direct-ray ablation and paired training protocol, see
+[Direct-ray experiment](ordered_rays.md).
 
 The `movement` network is a small alternative to the conventional feature
 transformer and dense layer stacks. It keeps the existing sparse training batch
@@ -32,28 +32,29 @@ already in Stockfish's negamax perspective.
 Every iteration adds messages along deterministic chess geometry:
 
 - knights and kings use fixed sparse jump edge lists;
-- pawns use fixed diagonal and forward directions, with the intervening state
-  transforming the two-square forward message;
-- bishops, rooks, and queens inject messages into ordered directional scans;
+- pawns use fixed diagonal and forward directions, including the state of the
+  one intervening square for a double push;
+- bishops, rooks, and queens send a direct message to every square on their
+  geometric ray;
 - all incoming messages are summed without counts or categorical annotations.
 
-Ray propagation never checks occupancy and never terminates at an occupied
-square. Each square first receives the current carrier and then applies the
-same learned transition before the carrier proceeds:
+Each direct slider relation contains its source and target square states,
+direction, distance, clipped blocker count, and the states of the first two
+occupied squares strictly between source and target. These blocker slots are
+selected from a fixed `[relation, path-square]` tensor in parallel. For a rook
+on `a1`, pawn on `a3`, and queen on `a7`, the `a1 -> a7` relation includes the
+pawn as its first blocker in the same layer.
 
 ```text
-gate   = hard_sigmoid(W_path h_square + b_path)
-altered = clamp(path_scale, -1, 1) * message
-message_next = message + gate * (altered - message)
+message = W_source h_source + W_target h_target
+        + W_first h_first_blocker + W_second h_second_blocker
+        + E_direction + E_distance + E_blocker_count
 ```
 
-The initial embedding is the only place where empty and piece states are
-identified. Consequently an empty square can learn to transmit most channels,
-while any intervening piece state can learn a different transformation. There
-are no explicit occupancy, termination, x-ray-strength, or piece-vacating
-features in the ray code. The transition is linear in the carried message for a
-fixed square state, so signals from multiple sources remain additive even when
-they travel through the same line.
+The network is told only primitive ray geometry and which intervening squares
+are occupied. It is not given pin, x-ray, or battery labels. The source-to-
+target relation means x-rays do not require an earlier message to be preserved
+through each blocker.
 
 The update is a shared-weight gated MLP:
 
@@ -63,7 +64,7 @@ gate      = hard_sigmoid(G_self h + G_message sum(messages))
 h_next    = h + gate * (candidate - h)
 ```
 
-Three iterations and an 8-value state use fewer than 1,500 learned parameters.
+Three iterations and an 8-value state remain compact.
 There are no Q/K/V projections and no dense 64 by 64 attention or adjacency
 tensor. A mean over the 64 final square states feeds a tiny scalar readout in the
 same units expected by the existing NNUE loss; `nnue2score` converts it to the
@@ -81,8 +82,8 @@ cone:
 
 1. changed source/destination squares;
 2. jump and pawn destinations of dirty squares;
-3. rank, file, and diagonal squares whose sequential path transformation can
-   depend on a dirty square;
+3. rank, file, and diagonal squares whose direct ray relation can include a
+   dirty source, target, or blocker;
 4. the same expansion once per recurrent iteration.
 
 States outside that cone are reused exactly. The Python implementation computes
@@ -90,30 +91,18 @@ batched message candidates before selecting dirty states, keeping training code
 simple. The native Stockfish implementation applies the same dependency lists
 in place and skips candidate calculations outside the cone.
 
-The native runtime builds its sparse relationships from Stockfish's fixed
-movement tables and ordered board directions. Each accumulator stack entry
-stores both color perspectives: 64 piece codes and `iterations + 1` arrays of
-64 small states.
-Search computes only the requested side-to-move perspective and finds the most
-recent cached state for that perspective when it is two plies back. The root
-initializes both perspectives. The pooled result is multiplied by the exported
-`nnue2score` before it is returned to search.
+The current native runtime implements the older sequential-ray model and is
+therefore incompatible with direct-ray checkpoints. A native implementation
+must construct the same fixed relation list, use parallel blocker extraction,
+and cross-check every score before engine games.
 
 ## Files and export
 
 The implementation is in `model/modules/movement.py`, selected in
 `model/model.py`, and trained through the normal `NNUE` wrapper. Save checkpoints
-or `.pt` models normally. `serialize.py checkpoint.pt network.mnnue` writes a
-portable little-endian runtime container with a versioned header and named,
-shaped float32 tensors; deterministic movement geometry is not duplicated in
-the file. The current native Stockfish runtime intentionally fixes the compact
-default profile (dimension 8, three iterations); training can use 3–5 iterations
-for experiments, but `.mnnue` export rejects a profile the engine cannot load.
+or `.pt` models normally. Direct-ray models cannot currently be written as
+`.mnnue`, because version 2 describes the old sequential-ray runtime.
 
 Stockfish's existing `.nnue` binary schema describes a feature transformer plus
-dense layer stacks and cannot represent a recurrent movement graph. The legacy
-writer therefore rejects movement models instead of emitting a file that
-Stockfish would misread. The native runtime reads the `.mnnue` tensor names,
-which map one-to-one to the embeddings, message matrices, shared path/update
-gates, and readout. Existing `.nnue` networks continue through the conventional
-loader and evaluator unchanged.
+dense layer stacks and cannot represent this graph. Both export paths reject
+direct-ray models rather than producing a file Stockfish would misread.
