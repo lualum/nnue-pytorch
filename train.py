@@ -227,6 +227,11 @@ def main():
     feature_name = args.nnue_lightning_config.features
 
     max_epoch = args.max_epochs or 800
+    # Seed before construction so paired architecture ablations share their
+    # initial weights. Seeding only after construction left them uncontrolled.
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
     if args.resume_from_model is None:
         nnue = M.NNUE(
             config=args.nnue_lightning_config,

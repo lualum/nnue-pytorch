@@ -34,6 +34,7 @@ class ModelConfig(LayerStacksConfig):
         parser.add_argument(
             "--movement-dim", type=int, default=ModelConfig.movement_dim
         )
+        parser.add_argument("--movement-ordered-rays", action="store_true")
         parser.add_argument(
             "--movement-iterations",
             type=int,
@@ -47,6 +48,7 @@ class ModelConfig(LayerStacksConfig):
         config.L2 = args.L2
         config.network_type = args.network_type
         config.movement_dim = args.movement_dim
+        config.movement_ordered_rays = getattr(args, "movement_ordered_rays", False)
         config.movement_iterations = args.movement_iterations
         config.__post_init__()
         return config
@@ -59,6 +61,9 @@ class ModelConfig(LayerStacksConfig):
 
     movement_dim: int = 8
     """Learned values per square in the movement evaluator."""
+
+    movement_ordered_rays: bool = False
+    """Experimental bounded channel mixing along ordered movement paths."""
 
     movement_iterations: int = 3
     """Number of shared-weight message/update iterations (must be 3 through 5)."""

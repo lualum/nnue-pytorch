@@ -52,6 +52,7 @@ class NNUEModel(nn.Module):
             self.movement = MovementEvaluationNetwork(
                 dim=config.movement_dim,
                 iterations=config.movement_iterations,
+                ordered_rays=config.movement_ordered_rays,
             )
             self.layer_stacks = None
             self.weight_clipping = []

@@ -1,5 +1,8 @@
 # Movement-based iterative evaluator
 
+For an optional order-sensitive path transition and a paired training protocol,
+see [Ordered-ray mixing experiment](ordered_rays.md).
+
 The `movement` network is a small alternative to the conventional feature
 transformer and dense layer stacks. It keeps the existing sparse training batch
 and scalar loss interface, but decodes the `HalfKAv2_hm^` component into 64

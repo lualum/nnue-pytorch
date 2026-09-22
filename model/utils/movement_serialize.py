@@ -27,6 +27,12 @@ class MovementNNUEWriter:
             description = "Lightweight movement NNUE"
 
         movement = model.movement
+        if movement.ordered_rays:
+            raise ValueError(
+                "Ordered-ray mixing requires a matching native runtime; "
+                "the version-2 .mnnue format cannot encode its transitions. "
+                "Save a training checkpoint or .pt model instead."
+            )
         if movement.dim != 8 or movement.iterations != 3:
             raise ValueError(
                 "The current Stockfish movement runtime requires dimension 8 "

@@ -255,13 +255,17 @@ class DualMovementAccumulator:
 class MovementEvaluationNetwork(nn.Module):
     """Small shared-weight graph network over chess movement relationships."""
 
-    def __init__(self, dim: int = 8, iterations: int = 3):
+    # Old pickled networks predate this option.
+    ordered_rays = False
+
+    def __init__(self, dim: int = 8, iterations: int = 3, ordered_rays: bool = False):
         super().__init__()
         if not 3 <= iterations <= 5:
             raise ValueError("iterations must be between 3 and 5.")
 
         self.dim = dim
         self.iterations = iterations
+        self.ordered_rays = ordered_rays
 
         self.piece_embedding = nn.Embedding(13, dim)
         self.square_embedding = nn.Embedding(64, dim)
@@ -276,6 +280,8 @@ class MovementEvaluationNetwork(nn.Module):
         # It is linear in the carried message, preserving additive contributions.
         self.path_gate = nn.Linear(dim, dim)
         self.path_scale = nn.Parameter(torch.zeros(dim))
+        if ordered_rays:
+            self.path_mix = nn.Parameter(torch.zeros(dim, dim))
         self.update = MovementUpdate(dim)
 
         self.readout_hidden = nn.Linear(dim, dim)
@@ -386,6 +392,26 @@ class MovementEvaluationNetwork(nn.Module):
         scale = torch.clamp(self.path_scale, -1.0, 1.0)
         return 1.0 + gate * (scale - 1.0)
 
+    def _path_transition(
+        self, carrier: torch.Tensor, factors: torch.Tensor
+    ) -> torch.Tensor:
+        """Order-sensitive, nonexpansive transition, linear in the carrier.
+
+        Independent channel factors commute. Adding a shared channel mixer
+        allows intervening states to transform a ray differently in each order.
+        Row L1 normalization bounds the mixer in the infinity norm; allocating
+        only 1 - abs(factor) to mixing bounds the entire transition by one.
+        Zero initialization reproduces the diagonal baseline exactly.
+        """
+        result = carrier * factors
+        if self.ordered_rays:
+            weight = self.path_mix / self.path_mix.abs().sum(
+                dim=1, keepdim=True
+            ).clamp_min(1.0)
+            mixed = torch.nn.functional.linear(carrier, weight)
+            result = result + (1.0 - factors.abs()) * mixed
+        return result
+
     def _ray_values(
         self,
         path_factors: torch.Tensor,
@@ -413,7 +439,7 @@ class MovementEvaluationNetwork(nn.Module):
             current_factors = path_factors.index_select(1, safe_indices)
             is_slider = slider_mask.index_select(1, safe_indices) & valid.view(1, -1)
             seed = projected.index_select(1, safe_indices) * is_slider.unsqueeze(-1)
-            carrier = (carrier * current_factors + seed) * valid_values
+            carrier = (self._path_transition(carrier, current_factors) + seed) * valid_values
 
         return values, destinations
 
@@ -488,7 +514,9 @@ class MovementEvaluationNetwork(nn.Module):
                 sources,
                 edge_destinations,
             )
-            edge_values = edge_values * path_factors.index_select(1, middles)
+            edge_values = self._path_transition(
+                edge_values, path_factors.index_select(1, middles)
+            )
             messages.index_add_(1, edge_destinations, edge_values)
 
         ray_projected = self.ray_message(hidden)
