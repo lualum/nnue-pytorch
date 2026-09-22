@@ -67,8 +67,9 @@ _Building the container will take it's time and disk space (~30-60GB)_
 ## Network training and management
 
 An experimental lightweight movement-geometry evaluator is available with
-`--network-type movement`. It uses 64 tiny square states, learned sequential
-ray propagation, and 3–5 shared recurrent updates without attention matrices.
+`--network-type movement`. It uses 64 tiny square states, direct ray relations
+with blocker context, and 3–5 shared recurrent updates
+without attention matrices.
 See [docs/movement_nnue.md](docs/movement_nnue.md) for architecture, training,
 and Stockfish runtime integration details.
 
