@@ -118,10 +118,10 @@ class NNUE(nn.Module):
         optimizer_config = self.config.optimizer_config
         self.optimizer_wrapper = optimizer_config.get_optimizer_wrapper()
 
-        if self.model.network_type == "movement":
+        if self.model.network_type in ("movement", "raygnn"):
             # The iterative evaluator is intentionally tiny; embeddings and
             # message/update/readout matrices share the dense decay setting.
-            movement = self.model.movement
+            movement = self.model.movement if self.model.network_type == "movement" else self.model.raygnn
             train_params = [
                 {
                     "params": _get_parameters([movement], get_biases=False),

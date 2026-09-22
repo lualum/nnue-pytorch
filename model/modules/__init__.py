@@ -18,6 +18,7 @@ from .movement import (
     MovementEvaluationNetwork,
     MovementFeatureDecoder,
 )
+from .raygnn import RayGNNEvaluationNetwork, RayGNNPosition
 
 __all__ = [
     "ComposedFeatureTransformer",
@@ -30,6 +31,8 @@ __all__ = [
     "MovementAccumulator",
     "MovementEvaluationNetwork",
     "MovementFeatureDecoder",
+    "RayGNNEvaluationNetwork",
+    "RayGNNPosition",
     "LayerStacksConfig",
     "add_feature_args",
     "get_available_features",

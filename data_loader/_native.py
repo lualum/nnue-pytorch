@@ -101,13 +101,25 @@ class Fen(ctypes.Structure):
 
 
 class FenBatch(ctypes.Structure):
-    _fields_ = [("size", ctypes.c_int), ("fens", ctypes.POINTER(Fen))]
+    _fields_ = [
+        ("size", ctypes.c_int),
+        ("fens", ctypes.POINTER(Fen)),
+        ("scores", ctypes.POINTER(ctypes.c_int)),
+        ("results", ctypes.POINTER(ctypes.c_int)),
+    ]
 
     def get_fens(self):
         strings = []
         for i in range(self.size):
             strings.append(self.fens[i].fen.decode("utf-8"))
         return strings
+
+    def get_records(self):
+        """Return FEN, side-to-move score, and side-to-move game result."""
+        return [
+            (self.fens[i].fen.decode("utf-8"), int(self.scores[i]), int(self.results[i]))
+            for i in range(self.size)
+        ]
 
 
 class CDataLoaderAPI:

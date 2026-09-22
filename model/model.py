@@ -8,6 +8,8 @@ from .modules import (
     LayerStacks,
     MovementEvaluationNetwork,
     MovementFeatureDecoder,
+    RayGNNEvaluationNetwork,
+    RayGNNPosition,
     get_feature_cls,
 )
 from .modules.features.halfka_v2_hm import HalfKav2Hm
@@ -39,7 +41,18 @@ class NNUEModel(nn.Module):
         self.num_psqt_buckets = num_psqt_buckets
         self.num_ls_buckets = num_ls_buckets
 
-        if self.network_type == "movement":
+        if self.network_type == "raygnn":
+            self.input = None
+            self.movement = None
+            self.raygnn = RayGNNEvaluationNetwork(
+                layers=config.raygnn_layers, with_wdl=config.raygnn_wdl
+            )
+            self.layer_stacks = None
+            self.weight_clipping = []
+            self.feature_name = "RayGNN-FEN"
+            self.input_feature_name = "RayGNN-FEN"
+            self.feature_hash = 0
+        elif self.network_type == "movement":
             configured_features = get_feature_cls(feature_name)
             if sum(fc is HalfKav2Hm for fc in configured_features) != 1:
                 raise ValueError(
@@ -54,6 +67,7 @@ class NNUEModel(nn.Module):
                 iterations=config.movement_iterations,
             )
             self.layer_stacks = None
+            self.raygnn = None
             self.weight_clipping = []
         else:
             feature_cls = get_feature_cls(feature_name)
@@ -64,6 +78,7 @@ class NNUEModel(nn.Module):
                 self.quantization,
             )
             self.movement = None
+            self.raygnn = None
             self.layer_stacks = LayerStacks(
                 self.num_ls_buckets, config, self.quantization
             )
@@ -72,9 +87,10 @@ class NNUEModel(nn.Module):
             )
             self.input.init_weights()
 
-        self.feature_name = self.input.FEATURE_NAME
-        self.input_feature_name = self.input.INPUT_FEATURE_NAME
-        self.feature_hash = self.input.HASH
+        if self.input is not None:
+            self.feature_name = self.input.FEATURE_NAME
+            self.input_feature_name = self.input.INPUT_FEATURE_NAME
+            self.feature_hash = self.input.HASH
 
     @torch.no_grad()
     def clip_weights(self, include_input):
@@ -82,7 +98,7 @@ class NNUEModel(nn.Module):
         Clips the weights of the model based on the min/max values allowed
         by the quantization scheme.
         """
-        if include_input:
+        if include_input and self.input is not None:
             self.input.clip_weights(self.quantization)
 
         for group in self.weight_clipping:
@@ -111,7 +127,8 @@ class NNUEModel(nn.Module):
 
     @torch.no_grad()
     def zero_virtual_weights(self) -> None:
-        self.input.zero_virtual_weights()
+        if self.input is not None:
+            self.input.zero_virtual_weights()
         if self.layer_stacks is not None:
             self.layer_stacks.zero_virtual_weights()
 
@@ -155,6 +172,12 @@ class NNUEModel(nn.Module):
         fake_quantize_acts: bool=True,
         fake_quantize_weights: bool=True,
     ):
+        if self.network_type == "raygnn":
+            raise RuntimeError(
+                "RayGNN requires fixed-White FEN/state input. Use forward_fens() or "
+                "forward_position(); the sparse NNUE loader does not provide castling, "
+                "en-passant, halfmove, or repetition state."
+            )
         if self.network_type == "movement":
             _ = them, piece_count, fake_quantize_acts, fake_quantize_weights
             board = self.input.decode(us, white_indices, black_indices)
@@ -177,6 +200,20 @@ class NNUEModel(nn.Module):
         x = self.layer_stacks(l0_, layer_stack_indices, fake_quantize_acts, fake_quantize_weights) + (wpsqt - bpsqt) * (us - 0.5)
 
         return x
+
+    def forward_position(self, position: RayGNNPosition, return_wdl: bool = False):
+        if self.raygnn is None:
+            raise RuntimeError("forward_position is available only for RayGNN models.")
+        return self.raygnn(position, return_wdl=return_wdl)
+
+    def forward_fens(self, fens, repetition_count=0, return_wdl: bool = False):
+        if self.raygnn is None:
+            raise RuntimeError("forward_fens is available only for RayGNN models.")
+        position = RayGNNPosition.from_fens(
+            fens, repetition_count=repetition_count,
+            device=next(self.raygnn.parameters()).device,
+        )
+        return self.raygnn(position, return_wdl=return_wdl)
 
     def forward_board(self, board: torch.Tensor) -> torch.Tensor:
         """Evaluate side-to-move-normalized piece codes directly."""

@@ -72,6 +72,18 @@ ray propagation, and 3–5 shared recurrent updates without attention matrices.
 See [docs/movement_nnue.md](docs/movement_nnue.md) for architecture, training,
 and Stockfish runtime integration details.
 
+## RayGNN v0.1
+
+`--network-type raygnn` selects the research RayGNN evaluator. It is a
+white-positive, non-incremental PyTorch reference model and intentionally does
+not accept the legacy sparse NNUE data-loader inputs: they omit castling,
+en-passant, halfmove, and repetition state. Use `NNUEModel.forward_fens()` or
+`forward_position(RayGNNPosition)` with a six-field FEN and a separate
+`repetition_count`. The model follows the v0.1 contract: three 64-wide ray
+message-passing layers, 160-wide per-square aggregation, structured 832-wide
+readout, 32-wide state path, raw-board skip, and a 928→256→64→1 correction
+head added to deterministic material.
+
 Hard way: [wiki](https://github.com/official-stockfish/nnue-pytorch/wiki/Basic-training-procedure-(train.py))
 
 Easier way: [wiki](https://github.com/official-stockfish/nnue-pytorch/wiki/Basic-training-procedure-(easy_train.py))

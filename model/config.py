@@ -28,7 +28,7 @@ class ModelConfig(LayerStacksConfig):
         )
         parser.add_argument(
             "--network-type",
-            choices=("nnue", "movement"),
+            choices=("nnue", "movement", "raygnn"),
             default=ModelConfig.network_type,
         )
         parser.add_argument(
@@ -39,6 +39,8 @@ class ModelConfig(LayerStacksConfig):
             type=int,
             default=ModelConfig.movement_iterations,
         )
+        parser.add_argument("--raygnn-layers", type=int, default=ModelConfig.raygnn_layers)
+        parser.add_argument("--raygnn-wdl", action="store_true")
 
     @staticmethod
     def get_model_config(args) -> "ModelConfig":
@@ -48,13 +50,15 @@ class ModelConfig(LayerStacksConfig):
         config.network_type = args.network_type
         config.movement_dim = args.movement_dim
         config.movement_iterations = args.movement_iterations
+        config.raygnn_layers = args.raygnn_layers
+        config.raygnn_wdl = args.raygnn_wdl
         config.__post_init__()
         return config
 
     # Not omitting prefix on purpose.
     quantize_config: QuantizationConfig = field(default_factory=QuantizationConfig)
 
-    network_type: Literal["nnue", "movement"] = "nnue"
+    network_type: Literal["nnue", "movement", "raygnn"] = "nnue"
     """Evaluator implementation. ``movement`` enables the iterative square network."""
 
     movement_dim: int = 8
@@ -63,11 +67,19 @@ class ModelConfig(LayerStacksConfig):
     movement_iterations: int = 3
     """Number of shared-weight message/update iterations (must be 3 through 5)."""
 
+    raygnn_layers: int = 3
+    """Number of parallel RayGNN message-passing layers."""
+
+    raygnn_wdl: bool = False
+    """Enable the auxiliary RayGNN WDL head."""
+
     def __post_init__(self) -> None:
         if self.movement_dim < 4:
             raise ValueError("movement_dim must be at least 4.")
         if not 3 <= self.movement_iterations <= 5:
             raise ValueError("movement_iterations must be between 3 and 5.")
+        if self.raygnn_layers < 1:
+            raise ValueError("raygnn_layers must be positive.")
 
 
 @dataclass(kw_only=True)

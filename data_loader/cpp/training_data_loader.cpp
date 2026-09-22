@@ -661,12 +661,21 @@ Fen::~Fen() { delete[] m_fen; }
 
 FenBatch::FenBatch(const std::vector<TrainingDataEntry>& entries) :
     m_size(entries.size()),
-    m_fens(new Fen[entries.size()]) {
-    for (int i = 0; i < m_size; ++i)
+    m_fens(new Fen[entries.size()]),
+    m_scores(new int[entries.size()]),
+    m_results(new int[entries.size()]) {
+    for (int i = 0; i < m_size; ++i) {
         m_fens[i] = entries[i].pos.fen();
+        m_scores[i] = entries[i].score;
+        m_results[i] = entries[i].result;
+    }
 }
 
-FenBatch::~FenBatch() { delete[] m_fens; }
+FenBatch::~FenBatch() {
+    delete[] m_fens;
+    delete[] m_scores;
+    delete[] m_results;
+}
 
 int FenBatchStream::calculate_num_reader_threads(int concurrency) {
     if (worker_thread_ratio >= 1)

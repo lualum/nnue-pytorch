@@ -134,6 +134,8 @@ struct FenBatch final {
 private:
     int m_size;
     Fen* m_fens;
+    int* m_scores;
+    int* m_results;
 };
 
 struct FenBatchStream final : Stream<FenBatch> {
@@ -165,4 +167,3 @@ private:
     static int calculate_num_reader_threads(int concurrency);
     static int calculate_num_worker_threads(int concurrency);
 };
-
