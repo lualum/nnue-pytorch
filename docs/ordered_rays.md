@@ -1,95 +1,57 @@
-# Ordered-ray mixing experiment
+# Direct-ray experiment
 
 ## Motivation
 
-The spatial evaluator proposal calls for blocker identity and order to affect
-long-range interactions. The existing movement evaluator already transports
-signals through learned square states, but each transition is diagonal:
-`c_next = f(h) * c`. For fixed intervening states A and B, their transformations
-commute. A single source's signal cannot distinguish A-then-B from B-then-A.
-This is a limitation of the path operator, not a claim that the whole network
-is invariant to swapping pieces: square embeddings, injected signals and
-subsequent iterations can already distinguish many such positions.
+Sequential ray propagation makes a long-range relation depend on every
+intermediate state preserving a useful signal. This is a poor fit for x-rays:
+in `rook -> pawn -> queen`, the rook-to-queen interaction must survive several
+separate updates before it exists. It also makes the result sensitive to an
+implementation order along the ray.
 
-Enable the experiment using `--movement-ordered-rays`. The transition becomes
+The movement evaluator now builds every directed slider relation at once. A
+relation has a source square, target square, direction, distance, the number of
+occupied squares strictly between them, and the first two occupied blocker
+states in board order. The relation for a rook on `a1` and queen on `a7` exists
+whether `a3` is empty or occupied. If a pawn occupies `a3`, it becomes the
+first blocker context of the direct `a1 -> a7` message.
 
-```
-W = path_mix / max(1, row_sum(abs(path_mix)))
-c_next = f(h) * c + (1 - abs(f(h))) * (W @ c)
-```
+This is a sparse tensor of about 1,500 directed source-target pairs, not dense
+attention. Blocker extraction is performed as gather and reduction operations
+over padded fixed path tensors, with no recurrent carrier or directional scan.
+The first two slots preserve the most immediately relevant x-ray structure;
+the clipped count reports whether further blockers exist. A later ablation can
+test three or more slots.
 
-These state-dependent matrices need not commute. The infinity norm of a
-transported signal cannot grow at a transition, since each matrix row has
-absolute sum at most one. New source injections can still increase the total
-carrier. The operation remains linear in the carrier, so multiple sliders can
-share the existing directional scan. The pawn double-step uses the same
-transition for consistency. Empty squares can also transform signals; no
-hand-coded pin, x-ray, or blocker labels are introduced.
-
-The mixer starts at zero, exactly reproducing the baseline for identical
-remaining weights while receiving gradients immediately. Default dimension 8
-adds 64 parameters. Work increases by a small matrix multiply per ray step;
-parameter count alone does not imply faster evaluation. The original option
-remains the default and retains its checkpoint tensor layout.
+`--movement-ordered-rays` remains accepted only for old scripts. It no longer
+changes the architecture because direct rays are always used.
 
 ## Training and comparison
 
-Use the existing binpack loader, optimizer, loss and checkpoint path:
+Use the normal trainer without the compatibility flag:
 
 ```sh
 python train.py train.binpack --validation-datasets valid.binpack \
   --validation-size 100000 --features 'HalfKAv2_hm^' \
   --network-type movement --movement-dim 8 --movement-iterations 3 \
   --batch-size 256 --epoch-size 1000000 --max-epochs 20 --seed 42 \
-  --default-root-dir runs/ray-baseline
+  --default-root-dir runs/direct-rays
 
-python train.py train.binpack --validation-datasets valid.binpack \
-  --validation-size 100000 --features 'HalfKAv2_hm^' \
-  --network-type movement --movement-dim 8 --movement-iterations 3 \
-  --movement-ordered-rays \
-  --batch-size 256 --epoch-size 1000000 --max-epochs 20 --seed 42 \
-  --default-root-dir runs/ray-ordered
-
-python -m pytest tests/test_movement_network.py tests/test_ordered_rays.py -q
+python -m pytest tests/test_movement_network.py tests/test_direct_rays.py -q
 ```
 
-Use game-disjoint training and validation files, repeat seeds, and compare both
-equal-position budgets and equal training time. Report held-out loss, tactical
-subsets and batch-one CPU inference time. Training on the bundled small.binpack
-is only a pipeline smoke test, not evidence of generalization or playing strength.
-The native loader can introduce sampling variation even with the same Torch
-seed. A controlled comparison should additionally fix the data stream.
+Use game-disjoint training and validation files. Compare against the last
+sequential branch at equal position budgets and equal wall time, then inspect a
+tactical x-ray subset separately. A lower general loss is necessary but not
+sufficient evidence that the extra relation context helps search.
 
-Ordered models save as training checkpoints or `.pt` models. Both existing
-Stockfish export formats are guarded: `.nnue` cannot represent movement graphs,
-and version-2 `.mnnue` has no channel-mixing runtime. Native execution, parity
-checks and matched-time engine games are still required before claiming an Elo
-gain. This change implements the experiment in the training/test suite, not a
-new native Stockfish evaluator.
-
-## Further changes to the supplied design
-
-* Separate piece and square states is a larger, independent ablation. Establish
-  whether this compact order-sensitive scan helps before adding six wide blocks.
-* Gated sum is still a sum; it does not inherently solve information loss.
-  Test separate friendly/enemy aggregation and preserve cardinality before
-  introducing per-square attention.
-* Horizontal reflection is not a general standard-chess symmetry when castling
-  rights remain. Standard castling destinations are not reflected onto their
-  counterparts. Disable that augmentation for these positions or explicitly
-  model the correct rules. Rank reflection plus color swap is a safer symmetry.
-* HalfKA decoding loses castling rights, en passant and history. Therefore this
-  existing training interface cannot implement the proposal's full global
-  state. Extending the loader is a separate necessary step if targets depend on
-  that information. Do not claim exact legal-position symmetry from board-only
-  encodings.
-* Benchmark the complete graph extraction and evaluator inside search. Fewer
-  edges than dense attention does not demonstrate NNUE-like incremental cost.
+Direct-ray checkpoints must remain `.ckpt` or `.pt` files. The existing native
+runtime and `.mnnue` format encode the old sequential-ray graph. Native
+execution requires a matching relation-list implementation followed by
+PyTorch-to-engine parity checks.
 
 ## Tests
 
-Tests cover exact baseline equivalence at initialization, nonzero mixer
-gradients, distinguishable path order, linear source superposition, the
-transition norm bound, incremental/full parity after several board edits,
-optimization through the sparse training interface, checkpoint restoration,
-and rejection by the incompatible native exporter.
+Tests verify that distant x-ray targets receive first and second blocker state
+in one call, a blocker changes the direct relation without recurrent path state,
+incremental evaluation matches full recomputation after edits, and checkpoint
+round-trip training works. The exporter rejects this incompatible layout.
