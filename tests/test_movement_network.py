@@ -14,7 +14,7 @@ from model.modules.movement import (
     MovementEvaluationNetwork,
     MovementFeatureDecoder,
 )
-from model.utils.movement_serialize import MOVEMENT_MAGIC, MovementNNUEWriter
+from model.utils.movement_serialize import MovementNNUEWriter
 from model.utils.serialize import NNUEWriter
 
 
@@ -91,7 +91,7 @@ def test_multiple_piece_messages_are_added():
     torch.testing.assert_close(messages[0, 11], torch.full((4,), 2.0))
 
 
-def test_ray_continuation_is_learned_from_square_state_not_occupancy():
+def test_direct_ray_has_blocker_context_beyond_first_blocker():
     network = MovementEvaluationNetwork(dim=4, iterations=3)
     for layer in (
         network.knight_message,
@@ -99,35 +99,36 @@ def test_ray_continuation_is_learned_from_square_state_not_occupancy():
         network.pawn_diagonal_message,
         network.pawn_forward_message,
         network.ray_message,
-        network.path_gate,
+        network.ray_target,
+        network.ray_first_blocker,
+        network.ray_second_blocker,
     ):
         _zero_linear(layer)
     _set_identity(network.ray_message)
-    _set_identity(network.path_gate)
     with torch.no_grad():
-        network.path_scale.zero_()
+        network.ray_first_blocker.weight.copy_(torch.eye(4))
+        network.ray_direction.weight.zero_()
+        network.ray_distance.weight.zero_()
+        network.ray_blocker_count.weight.zero_()
 
     board = torch.zeros(1, 64, dtype=torch.long)
     board[0, 0] = OUR_ROOK
     board[0, 16] = OUR_PAWN
-    hidden = torch.full((1, 64, 4), -2.5)
+    hidden = torch.zeros(1, 64, 4)
     hidden[0, 0] = 1.0
+    hidden[0, 16] = 2.0
 
-    transmitting = network.aggregate_messages(hidden, board)
-    torch.testing.assert_close(transmitting[0, 8], torch.ones(4))
-    torch.testing.assert_close(transmitting[0, 16], torch.ones(4))
-    torch.testing.assert_close(transmitting[0, 40], torch.ones(4))
-
-    suppressing_hidden = hidden.clone()
-    suppressing_hidden[0, 16] = 2.5
-    suppressing = network.aggregate_messages(suppressing_hidden, board)
-    torch.testing.assert_close(suppressing[0, 16], torch.ones(4))
-    torch.testing.assert_close(suppressing[0, 24], torch.zeros(4))
-
-    empty_board = board.clone()
-    empty_board[0, 16] = 0
-    empty_but_suppressing = network.aggregate_messages(suppressing_hidden, empty_board)
-    torch.testing.assert_close(empty_but_suppressing[0, 24], torch.zeros(4))
+    values = network._ray_values(
+        hidden,
+        board,
+        board == OUR_ROOK,
+        torch.zeros_like(board, dtype=torch.bool),
+    )
+    relation = (network._ray_sources == 0) & (network._ray_destinations == 40)
+    assert relation.sum() == 1
+    # The a1 -> a6 x-ray relation receives a1 plus the first blocker a3 in
+    # the same layer. It does not wait for a carrier to traverse a2 then a3.
+    torch.testing.assert_close(values[0, relation][0], torch.full((4,), 3.0))
 
 
 def test_network_is_small_shared_weight_and_differentiable():
@@ -141,7 +142,7 @@ def test_network_is_small_shared_weight_and_differentiable():
     result = network(board)
     assert result.shape == (2, 1)
     assert network.parameter_count < 10_000
-    assert MovementEvaluationNetwork().parameter_count < 1_500
+    assert MovementEvaluationNetwork().parameter_count < 2_500
     assert sum(1 for name, _ in network.named_modules() if name == "update") == 1
 
     result.sum().backward()
@@ -203,8 +204,5 @@ def test_model_training_interface_and_legacy_export_guard():
     with pytest.raises(ValueError, match="cannot encode movement graphs"):
         NNUEWriter(model, verbose=False)
 
-    movement_writer = MovementNNUEWriter(model, "test movement net")
-    assert movement_writer.buf.startswith(MOVEMENT_MAGIC)
-    assert b"piece_embedding.weight" in movement_writer.buf
-    assert b"path_gate.weight" in movement_writer.buf
-    assert b"xray_gate" not in movement_writer.buf
+    with pytest.raises(ValueError, match="Direct ray relations"):
+        MovementNNUEWriter(model, "test movement net")
