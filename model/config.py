@@ -34,7 +34,11 @@ class ModelConfig(LayerStacksConfig):
         parser.add_argument(
             "--movement-dim", type=int, default=ModelConfig.movement_dim
         )
-        parser.add_argument("--movement-ordered-rays", action="store_true")
+        parser.add_argument(
+            "--movement-ordered-rays",
+            action="store_true",
+            help="Deprecated compatibility flag; direct ray relations are always used.",
+        )
         parser.add_argument(
             "--movement-iterations",
             type=int,
@@ -63,7 +67,7 @@ class ModelConfig(LayerStacksConfig):
     """Learned values per square in the movement evaluator."""
 
     movement_ordered_rays: bool = False
-    """Experimental bounded channel mixing along ordered movement paths."""
+    """Deprecated compatibility setting; direct ray relations are always used."""
 
     movement_iterations: int = 3
     """Number of shared-weight message/update iterations (must be 3 through 5)."""
