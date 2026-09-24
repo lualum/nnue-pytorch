@@ -96,7 +96,9 @@ class RayGNN(nn.Module):
             if side_to_move is None or castling is None or en_passant is None:
                 raise ValueError("side_to_move, castling and en_passant are required")
             batch = PositionBatch(piece, side_to_move, castling, en_passant, draw_state)
-        batch.validate()
+        # Value checks on CUDA tensors synchronize the device on every forward.
+        # Inputs constructed on CPU are checked before transfer.
+        batch.validate(check_values=batch.piece.device.type == "cpu")
         piece = batch.piece
         state = self.state_encoder(batch.side_to_move, batch.castling,
                                    batch.en_passant, batch.draw_state)

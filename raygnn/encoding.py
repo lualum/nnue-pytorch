@@ -23,17 +23,18 @@ class PositionBatch:
                                for value in (self.piece, self.side_to_move, self.castling,
                                              self.en_passant, self.draw_state)))
 
-    def validate(self) -> None:
+    def validate(self, check_values: bool = True) -> None:
         if self.piece.ndim != 2 or self.piece.shape[1] != 64:
             raise ValueError("piece must have shape [B,64]")
         batch = self.piece.shape[0]
-        if self.piece.dtype != torch.long or bool(((self.piece < 0) | (self.piece > 12)).any()):
+        if self.piece.dtype != torch.long or (check_values and bool(((self.piece < 0) | (self.piece > 12)).any())):
             raise ValueError("piece IDs must be long integers in 0..12")
-        if self.side_to_move.shape != (batch, 1) or bool((self.side_to_move.abs() != 1).any()):
+        if self.side_to_move.shape != (batch, 1) or (check_values and bool((self.side_to_move.abs() != 1).any())):
             raise ValueError("side_to_move must have shape [B,1] with values +1 or -1")
-        if self.castling.shape != (batch, 4) or bool(((self.castling != 0) & (self.castling != 1)).any()):
+        if self.castling.shape != (batch, 4) or (check_values and bool(((self.castling != 0) & (self.castling != 1)).any())):
             raise ValueError("castling must have shape [B,4] with binary values")
-        if self.en_passant.shape != (batch,) or self.en_passant.dtype != torch.long or bool(((self.en_passant < 0) | (self.en_passant > 64)).any()):
+        if (self.en_passant.shape != (batch,) or self.en_passant.dtype != torch.long or
+                (check_values and bool(((self.en_passant < 0) | (self.en_passant > 64)).any()))):
             raise ValueError("en_passant must contain square indices 0..63 or 64 for none")
         if self.draw_state is not None and (self.draw_state.ndim != 2 or self.draw_state.shape[0] != batch):
             raise ValueError("draw_state must have shape [B,D]")
@@ -66,6 +67,60 @@ def boards_to_batch(boards: list[chess.Board], device: torch.device | str = "cpu
                       for board in boards], dtype=torch.float32),
     )
     batch.validate()
+    return batch.to(device)
+
+
+_FEN_PIECES = {symbol: piece + (0 if symbol.isupper() else 6)
+               for piece, symbols in enumerate(("", "pP", "nN", "bB", "rR", "qQ", "kK"))
+               for symbol in symbols}
+
+
+def fens_to_batch(fens: list[str], device: torch.device | str = "cpu") -> PositionBatch:
+    """Encode FEN fields directly for scored-position training without chess.Board objects."""
+    if not fens:
+        raise ValueError("fens cannot be empty")
+    pieces, turns, castling, en_passant = [], [], [], []
+    for fen in fens:
+        fields = fen.split()
+        if len(fields) < 4:
+            raise ValueError(f"incomplete FEN: {fen!r}")
+        ranks = fields[0].split("/")
+        if len(ranks) != 8:
+            raise ValueError(f"invalid FEN board: {fen!r}")
+        row = [0] * 64
+        for rank_index, rank in enumerate(ranks):
+            file_index = 0
+            for symbol in rank:
+                if symbol in "12345678":
+                    file_index += int(symbol)
+                else:
+                    if symbol not in _FEN_PIECES or file_index >= 8:
+                        raise ValueError(f"invalid FEN piece placement: {fen!r}")
+                    row[(7 - rank_index) * 8 + file_index] = _FEN_PIECES[symbol]
+                    file_index += 1
+            if file_index != 8:
+                raise ValueError(f"invalid FEN rank width: {fen!r}")
+        if fields[1] not in ("w", "b"):
+            raise ValueError(f"invalid FEN side to move: {fen!r}")
+        if fields[2] != "-" and (set(fields[2]) - set("KQkq")):
+            raise ValueError(f"invalid FEN castling rights: {fen!r}")
+        ep = fields[3]
+        if ep == "-":
+            ep_square = 64
+        elif len(ep) == 2 and ep[0] in "abcdefgh" and ep[1] in "12345678":
+            ep_square = (int(ep[1]) - 1) * 8 + ord(ep[0]) - ord("a")
+        else:
+            raise ValueError(f"invalid FEN en-passant square: {fen!r}")
+        pieces.append(row)
+        turns.append([1.0 if fields[1] == "w" else -1.0])
+        castling.append([float(right in fields[2]) for right in "KQkq"])
+        en_passant.append(ep_square)
+    batch = PositionBatch(
+        torch.tensor(pieces, dtype=torch.long),
+        torch.tensor(turns, dtype=torch.float32),
+        torch.tensor(castling, dtype=torch.float32),
+        torch.tensor(en_passant, dtype=torch.long),
+    )
     return batch.to(device)
 
 

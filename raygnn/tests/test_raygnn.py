@@ -5,7 +5,7 @@ import chess
 import pytest
 import torch
 
-from raygnn import RayGNN, RayGNNConfig, RayGNNEvaluator, boards_to_batch
+from raygnn import RayGNN, RayGNNConfig, RayGNNEvaluator, boards_to_batch, fens_to_batch
 from raygnn.encoding import swap_colors_reflect_ranks
 from raygnn.geometry import BoardGeometry
 from raygnn.train import TeacherDataset
@@ -116,6 +116,18 @@ def test_state_en_passant_and_rank_reflection():
     assert transformed.en_passant.item() == chess.E6
     assert transformed.side_to_move.item() == 1
     assert transformed.castling.tolist() == [[1, 1, 1, 1]]
+
+
+def test_fast_fen_encoding_matches_board_encoding():
+    fens = [
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
+        "4k3/8/8/8/8/8/4P3/4K3 w - - 0 1",
+    ]
+    fast = fens_to_batch(fens)
+    reference = boards_to_batch([chess.Board(fen) for fen in fens])
+    for field in ("piece", "side_to_move", "castling", "en_passant"):
+        assert torch.equal(getattr(fast, field), getattr(reference, field))
 
 
 def test_draw_state_contract_requires_history_in_training_records():
