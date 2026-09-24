@@ -147,21 +147,26 @@ class SquareEncoder(nn.Module):
     def __init__(self, king_relative: bool = False):
         super().__init__()
         self.king_relative = king_relative
-        self.piece_embedding = nn.Embedding(13, 16)
-        self.project = nn.Linear(22 if king_relative else 18, 64)
-        squares = torch.arange(64)
-        self.register_buffer("coords", torch.stack((squares % 8, squares // 8), -1).float() / 7)
+        self.piece_embedding = nn.Embedding(13, 96)
+        self.joint_embedding = nn.Embedding(13 * 64, 96)
+        nn.init.normal_(self.piece_embedding.weight, 0, 0.05)
+        nn.init.normal_(self.joint_embedding.weight, 0, 0.05)
+        if king_relative:
+            self.king_project = nn.Linear(4, 96, bias=False)
+        self.register_buffer("squares", torch.arange(64))
 
     def forward(self, piece: Tensor) -> Tensor:
-        coords = self.coords[None].expand(piece.shape[0], -1, -1)
-        values = [self.piece_embedding(piece), coords.to(self.piece_embedding.weight.dtype)]
+        result = self.piece_embedding(piece) + self.joint_embedding(piece * 64 + self.squares[None])
         if self.king_relative:
             if bool(((piece == 6).sum(1) != 1).any()) or bool(((piece == 12).sum(1) != 1).any()):
                 raise ValueError("king-relative encoding requires exactly one king of each color")
-            white = coords[torch.arange(piece.shape[0], device=piece.device), (piece == 6).long().argmax(1)]
-            black = coords[torch.arange(piece.shape[0], device=piece.device), (piece == 12).long().argmax(1)]
-            values.extend((coords - white[:, None], coords - black[:, None]))
-        return self.project(torch.cat(values, -1))
+            white = (piece == 6).long().argmax(1)
+            black = (piece == 12).long().argmax(1)
+            coords = torch.stack((self.squares % 8, self.squares // 8), -1).to(result.dtype)
+            offsets = torch.cat((coords[None] - coords[white, None],
+                                 coords[None] - coords[black, None]), -1) / 7
+            result = result + self.king_project(offsets)
+        return result
 
 
 def raw_board_one_hot(piece: Tensor) -> Tensor:

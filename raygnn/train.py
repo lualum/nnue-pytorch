@@ -89,30 +89,26 @@ def main() -> None:
     parser.add_argument("data", type=Path, help="JSONL with fen, White-positive eval_cp and game_id")
     parser.add_argument("--output", type=Path, required=True, help="best checkpoint path")
     parser.add_argument("--variant", default="reference", choices=(
-        "reference", "original_compact", "no_message", "raw_board_only", "channelwise_gates",
-        "king_relative", "smaller_messages", "smaller_readout", "relation_biases",
-        "one_layer", "three_layers"))
-    parser.add_argument("--epochs", type=int, default=20, help="total epochs, usually 20 screen or 50 confirm")
-    parser.add_argument("--horizon", type=int, default=50, help="schedule length, fixed from screening start")
+        "reference", "no_message", "no_relation_separation", "dense_context",
+        "king_relative", "wider_spatial", "wider_messages", "global_pooling",
+        "three_layers", "simple_pair"))
+    parser.add_argument("--epochs", type=int, default=5, help="total million-position epochs")
+    parser.add_argument("--horizon", type=int, default=20, help="schedule length, fixed from screening start")
     parser.add_argument("--epoch-size", type=int, default=1_000_000, help="sampled positions across all devices")
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=0.001)
+    parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument("--lr", type=float, default=0.0003)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--target-transform", choices=("existing_tanh", "cp_pawns"), default="existing_tanh")
+    parser.add_argument("--target-transform", choices=("existing_tanh", "cp_pawns"), default="cp_pawns")
     parser.add_argument("--augment-color", action="store_true")
     parser.add_argument("--draw-state", action="store_true", help="use halfmove/100 and twofold repetition")
-    parser.add_argument("--float32-reductions", action="store_true")
     parser.add_argument("--edge-chunk-size", type=int)
-    parser.add_argument("--sparse-board-projection", action="store_true")
     parser.add_argument("--resume", type=Path, help="resume this architecture's latest checkpoint")
     args = parser.parse_args()
     if min(args.epochs, args.horizon, args.epoch_size, args.batch_size) < 1 or args.epochs > args.horizon:
         parser.error("epochs, horizon, epoch-size and batch-size must be positive; epochs <= horizon")
     config = RayGNNConfig.variant(args.variant)
-    config = replace(config, float32_reductions=args.float32_reductions,
-                     edge_chunk_size=args.edge_chunk_size,
-                     sparse_board_projection=args.sparse_board_projection,
+    config = replace(config, edge_chunk_size=args.edge_chunk_size,
                      draw_state_fields=("halfmove_clock_div_100", "repetition_twofold") if args.draw_state else ())
     torch.manual_seed(args.seed)
     training, validation = load_splits(args.data)
@@ -120,13 +116,24 @@ def main() -> None:
     val_set = TeacherDataset(validation, args.target_transform, args.draw_state)
     val_loader = DataLoader(val_set, batch_size=args.batch_size, collate_fn=collate)
     model = RayGNN(config).to(args.device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.horizon)
+    decay = [parameter for name, parameter in model.named_parameters()
+             if parameter.requires_grad and parameter.ndim > 1 and "piece_square" not in name]
+    no_decay = [parameter for name, parameter in model.named_parameters()
+                if parameter.requires_grad and (parameter.ndim <= 1 or "piece_square" in name)]
+    optimizer = torch.optim.AdamW([{"params": decay, "weight_decay": 1e-4},
+                                   {"params": no_decay, "weight_decay": 0.0}], lr=args.lr)
+    total_steps = args.horizon * math.ceil(args.epoch_size / args.batch_size)
+    def lr_factor(step):
+        if step < 200:
+            return (step + 1) / 200
+        progress = min(1.0, (step - 200) / max(1, total_steps - 200))
+        return 0.1 + 0.9 * (1 + math.cos(math.pi * progress)) / 2
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_factor)
     scaler = torch.amp.GradScaler("cuda", enabled=args.device.startswith("cuda"))
     best, first_epoch = float("inf"), 0
     if args.resume:
         saved = torch.load(args.resume, map_location=args.device, weights_only=True)
-        if saved["config"] != asdict(config) or saved["seed"] != args.seed or saved["target_transform"] != args.target_transform or saved["horizon"] != args.horizon or saved["epoch_size"] != args.epoch_size or saved["augment_color"] != args.augment_color:
+        if saved.get("architecture_version") != "v3" or saved["config"] != asdict(config) or saved["seed"] != args.seed or saved["target_transform"] != args.target_transform or saved["horizon"] != args.horizon or saved["epoch_size"] != args.epoch_size or saved["augment_color"] != args.augment_color:
             raise ValueError("resume checkpoint experiment contract differs from this run")
         model.load_state_dict(saved["model"])
         optimizer.load_state_dict(saved["optimizer"])
@@ -136,6 +143,7 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     latest = args.output.with_name(args.output.stem + ".latest" + args.output.suffix)
     metadata = {
+        "architecture_version": "v3", "relation_classes": ["direct", "xray", "context"],
         "config": asdict(config), "seed": args.seed, "horizon": args.horizon,
         "epoch_size": args.epoch_size, "augment_color": args.augment_color,
         "target_transform": args.target_transform,
@@ -173,10 +181,12 @@ def main() -> None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
+            if scaler.get_scale() >= scale_before:
+                scheduler.step()
             loss_sum += loss.item() * target.shape[0]
-        scheduler.step()
         validation_loss = evaluate(model, val_loader, args.device)
         print(f"epoch={epoch + 1} train={loss_sum / args.epoch_size:.5f} validation={validation_loss:.5f}")
         if validation_loss < best:

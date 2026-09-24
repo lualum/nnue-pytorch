@@ -16,10 +16,10 @@ def test_reference_shapes_gradients_and_forward_contract():
     model = RayGNN()
     assert len(model.layers) == 2
     assert model.layers[0] is not model.layers[1]
-    assert model.layers[0].update[0].in_features == 144
-    assert model.readout.first.in_features == 128
-    assert model.head[0].in_features == 976
-    assert model.encoder(batch.piece).shape == (2, 64, 64)
+    assert model.layers[0].update[0].in_features == 310
+    assert model.readout.spatial.in_features == 192
+    assert model.readout.head[0].in_features == 528
+    assert model.encoder(batch.piece).shape == (2, 64, 96)
     assert model.state_encoder(batch.side_to_move, batch.castling, batch.en_passant).shape == (2, 16)
     features, classes = model.geometry.edge_features(batch.piece)
     assert features.shape == (2, 1792, 31)
@@ -30,9 +30,9 @@ def test_reference_shapes_gradients_and_forward_contract():
     assert value.shape == (2, 1)
     assert torch.allclose(value, model(batch))
     value.sum().backward()
-    for weight in (model.encoder.project.weight, model.edge_encoder.weight,
+    for weight in (model.encoder.joint_embedding.weight, model.edge_encoder.weight,
                    model.layers[0].source_project.weight, model.layers[1].source_project.weight,
-                   model.head[0].weight):
+                   model.readout.head[0].weight):
         assert weight.grad is not None and torch.isfinite(weight.grad).all()
 
 
@@ -137,7 +137,7 @@ def test_draw_state_contract_requires_history_in_training_records():
     dataset = TeacherDataset([{**row, "repetition_twofold": True}], "cp_pawns", use_draw_state=True)
     assert dataset[0][1] == 0.5
     batch = boards_to_batch([chess.Board()])
-    model = RayGNN(replace(RayGNNConfig.variant("raw_board_only"),
+    model = RayGNN(replace(RayGNNConfig.variant("no_message"),
                            draw_state_fields=("halfmove_clock_div_100", "repetition_twofold")))
     assert model(batch).shape == (1, 1)
     with pytest.raises(ValueError, match="draw_state"):
@@ -145,42 +145,62 @@ def test_draw_state_contract_requires_history_in_training_records():
 
 
 @pytest.mark.parametrize("variant", [
-    "reference", "original_compact", "no_message", "raw_board_only", "channelwise_gates",
-    "king_relative", "smaller_messages", "smaller_readout", "relation_biases",
-    "one_layer", "three_layers",
+    "reference", "no_message", "no_relation_separation", "dense_context",
+    "king_relative", "wider_spatial", "wider_messages", "global_pooling",
+    "three_layers", "simple_pair",
 ])
 def test_variants_forward(variant):
     batch = boards_to_batch([chess.Board()])
     model = RayGNN(RayGNNConfig.variant(variant))
     output = model(batch)
     assert output.shape == (1, 1) and torch.isfinite(output).all()
-    if variant == "original_compact":
-        assert model.layers[0].update[0].in_features == 112
-        assert model.head[0].in_features == 912
-    if variant == "raw_board_only":
-        assert model.head[0].in_features == 848
+    if variant == "no_relation_separation":
+        assert model.layers[0].update[0].in_features == 178
+    if variant == "wider_messages":
+        assert model.layers[0].update[0].in_features == 406
 
 
-def test_implementation_variants_match_reference_outputs_and_gradients():
+def test_dense_reference_and_chunked_outputs_and_gradients():
     batch = boards_to_batch([chess.Board()])
     reference = RayGNN()
-    for change in (dict(edge_chunk_size=137), dict(float32_reductions=True),
-                   dict(sparse_board_projection=True)):
+    for change in (dict(edge_chunk_size=137), dict(dense_reference=True)):
         variant = RayGNN(replace(reference.config, **change))
         variant.load_state_dict(reference.state_dict())
         first, second = reference(batch), variant(batch)
         assert torch.allclose(first, second, atol=1e-5, rtol=1e-5)
         first.sum().backward()
         second.sum().backward()
-        assert torch.allclose(reference.head[0].weight.grad,
-                              variant.head[0].weight.grad, atol=1e-5, rtol=1e-5)
+        for name in ("encoder.joint_embedding.weight", "edge_encoder.weight",
+                     "layers.0.pair.0.0.weight", "layers.0.pair.1.0.weight",
+                     "layers.0.pair.2.0.weight", "readout.head.0.weight"):
+            first_grad = dict(reference.named_parameters())[name].grad
+            second_grad = dict(variant.named_parameters())[name].grad
+            assert first_grad is not None and second_grad is not None
+            assert torch.allclose(first_grad, second_grad, atol=1e-5, rtol=1e-5), name
         reference.zero_grad()
+
+
+def test_relationship_precedence_and_inactive_edges():
+    geometry = BoardGeometry()
+    piece = torch.zeros((1, 64), dtype=torch.long)
+    piece[0, chess.A1] = 4  # rook
+    piece[0, chess.A3] = 1  # first blocker
+    piece[0, chess.A5] = 1  # second blocker
+    _, relation = geometry.edge_features(piece)
+    def edge(src, dst):
+        return ((geometry.src == src) & (geometry.dst == dst)).nonzero()[0, 0]
+    assert relation[0, edge(chess.A1, chess.A2)] == 0
+    assert relation[0, edge(chess.A1, chess.A4)] == 1
+    assert relation[0, edge(chess.A1, chess.A6)] == -1
+    assert relation[0, edge(chess.B2, chess.C3)] == 2  # empty-source adjacency
+    assert relation[0, edge(chess.B2, chess.E5)] == -1
+
 
 
 def test_engine_scores_and_validation():
     board = chess.Board()
     batch = boards_to_batch([board])
-    model = RayGNN(RayGNNConfig.variant("raw_board_only"))
+    model = RayGNN(RayGNNConfig.variant("no_message"))
     evaluator = RayGNNEvaluator(model)
     expected = torch.round(100 * model(batch)[:, 0]).long()
     assert torch.equal(evaluator.evaluate_cp([board]), expected)

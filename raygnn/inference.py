@@ -17,6 +17,8 @@ class RayGNNEvaluator:
     @classmethod
     def from_checkpoint(cls, path: str | Path, device: str | torch.device = "cpu") -> "RayGNNEvaluator":
         checkpoint = torch.load(path, map_location=device, weights_only=True)
+        if checkpoint.get("architecture_version") != "v3":
+            raise ValueError("checkpoint is not a RayGNN v3 checkpoint")
         model = RayGNN(RayGNNConfig(**checkpoint["config"]))
         model.load_state_dict(checkpoint["model"])
         return cls(model, device)

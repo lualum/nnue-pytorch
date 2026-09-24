@@ -39,7 +39,7 @@ class BoardGeometry(nn.Module):
         self.register_buffer("is_knight", torch.tensor(knights, dtype=torch.bool))
 
     def edge_features(self, piece: Tensor, dtype: torch.dtype = torch.float32) -> tuple[Tensor, Tensor]:
-        """Return [B,1792,31] features and exclusive gate-bias class IDs."""
+        """Return [B,1792,31] features and exclusive relationship IDs; -1 is inactive."""
         b = piece.shape[0]
         interior = piece[:, self.between]
         occupied = (interior != 0) & self.between_mask[None]
@@ -81,5 +81,8 @@ class BoardGeometry(nn.Module):
             (source_piece != 0)[..., None].to(dtype), (destination_piece != 0)[..., None].to(dtype),
             pawn_forward[..., None].to(dtype),
         ), -1)
-        classes = torch.where(direct, 0, torch.where(source_piece != 0, 1, 2))
+        slider = ((kind == 4) & orthogonal[None]) | ((kind == 3) & diagonal[None]) | ((kind == 5) & (orthogonal | diagonal)[None])
+        xray = (source_piece != 0) & slider & (count == 1) & ~direct
+        context = (~direct & ~xray) & (adjacent[None] | pawn_forward)
+        classes = torch.where(direct, 0, torch.where(xray, 1, torch.where(context, 2, -1)))
         return features, classes
