@@ -1,93 +1,113 @@
-"""RayGNN reference architecture with a White-positive pawn-unit value."""
+"""Second-design RayGNN: White-positive, unbounded pawn-unit value."""
 
 from dataclasses import dataclass
 
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 
-from .encoding import (
-    PositionBatch,
-    SquareEncoder,
-    raw_board_one_hot,
-    swap_colors_rotate,
-)
+from .encoding import PositionBatch, SquareEncoder, StateEncoder, raw_board_one_hot
 from .geometry import BoardGeometry
 from .layers import RayLayer
-from .readout import StructuredReadout
+from .readout import GlobalReadout
 
 
 @dataclass(frozen=True)
 class RayGNNConfig:
-    d_model: int = 64
-    d_msg: int = 16
-    layers: int = 3
-    use_xray: bool = True
-    first_piece_only: bool = False
-    structured_readout: bool = True
-    raw_board_skip: bool = True
-    wdl_head: bool = False
-    enforce_color_symmetry: bool = True
+    layers: int = 2
+    message_width: int = 32
+    readout_width: int = 128
+    readout_final_activation: bool = True
+    channelwise_gates: bool = False
+    king_relative: bool = False
+    relation_biases: bool = False
+    raw_board_only: bool = False
+    float32_reductions: bool = False
+    edge_chunk_size: int | None = None
+    sparse_board_projection: bool = False
+    draw_state_fields: tuple[str, ...] = ()
 
+    def __post_init__(self):
+        if self.layers < 0 or self.message_width < 1 or self.readout_width < 1:
+            raise ValueError("layers and widths must be valid positive dimensions")
+        if self.edge_chunk_size is not None and self.edge_chunk_size < 1:
+            raise ValueError("edge_chunk_size must be positive")
+        if self.raw_board_only and self.layers:
+            raise ValueError("raw-board-only variant requires layers=0")
 
-@dataclass
-class Evaluation:
-    value: Tensor
-    material: Tensor
-    correction: Tensor
-    wdl_logits: Tensor | None = None
+    @classmethod
+    def variant(cls, name: str) -> "RayGNNConfig":
+        variants = {
+            "reference": {},
+            "original_compact": {"message_width": 16, "readout_width": 64,
+                                 "readout_final_activation": False},
+            "no_message": {"layers": 0},
+            "raw_board_only": {"layers": 0, "raw_board_only": True},
+            "channelwise_gates": {"channelwise_gates": True},
+            "king_relative": {"king_relative": True},
+            "smaller_messages": {"message_width": 16},
+            "smaller_readout": {"readout_width": 64},
+            "relation_biases": {"relation_biases": True},
+            "one_layer": {"layers": 1},
+            "three_layers": {"layers": 3},
+        }
+        if name not in variants:
+            raise ValueError(f"unknown variant {name!r}; choose from {tuple(variants)}")
+        return cls(**variants[name])
 
 
 class RayGNN(nn.Module):
     def __init__(self, config: RayGNNConfig | None = None):
         super().__init__()
-        config = config or RayGNNConfig()
-        self.config = config
-        self.geometry = BoardGeometry()
-        self.encoder = SquareEncoder(config.d_model)
-        self.layers = nn.ModuleList(RayLayer(config.d_model, config.d_msg) for _ in range(config.layers))
-        self.readout = StructuredReadout(config.d_model) if config.structured_readout else None
-        self.state_project = nn.Sequential(nn.Linear(23, 32), nn.SiLU(), nn.Linear(32, 32))
-        self.raw_project = nn.Linear(64 * 13, 64) if config.raw_board_skip else None
-        readout_width = self.readout.output_dim if self.readout is not None else config.d_model
-        head_width = readout_width + 32 + (64 if config.raw_board_skip else 0)
-        self.head = nn.Sequential(nn.Linear(head_width, 256), nn.SiLU(), nn.Linear(256, 64), nn.SiLU())
-        self.value_head = nn.Linear(64, 1)
-        self.wdl_head = nn.Linear(64, 3) if config.wdl_head else None
-        self.register_buffer("material_weights", torch.tensor([100, 320, 330, 500, 900, 0], dtype=torch.float32), persistent=False)
+        self.config = config or RayGNNConfig()
+        config = self.config
+        self.state_encoder = StateEncoder(config.draw_state_fields)
+        self.geometry = BoardGeometry() if config.layers else None
+        self.encoder = None if config.raw_board_only else SquareEncoder(config.king_relative)
+        self.edge_encoder = nn.Linear(31, config.message_width) if config.layers else None
+        self.layers = nn.ModuleList(RayLayer(config.message_width, config.channelwise_gates,
+                                             config.relation_biases, config.float32_reductions,
+                                             config.edge_chunk_size) for _ in range(config.layers))
+        self.readout = None if config.raw_board_only else GlobalReadout(
+            config.readout_width, config.readout_final_activation)
+        head_width = (0 if config.raw_board_only else config.readout_width) + 832 + 16
+        self.head = nn.Sequential(nn.Linear(head_width, 64), nn.SiLU(), nn.Linear(64, 1))
 
-    def _forward_once(self, batch: PositionBatch) -> Evaluation:
-        piece = batch.piece
-        h = self.encoder(batch)
-        if self.layers:
-            ray = self.geometry.rays(piece)
-            for layer in self.layers:
-                h = layer(h, piece, self.geometry, ray, self.config.use_xray, self.config.first_piece_only)
-        global_h = self.readout(h, piece, self.geometry) if self.readout is not None else h.mean(1)
-        counts = torch.stack([(piece == index).sum(1) for index in range(1, 13)], -1).float()
-        material = ((counts[:, :6] - counts[:, 6:]) * self.material_weights).sum(-1, keepdim=True) / 100
-        phase = (counts[:, [1, 2, 3, 4, 7, 8, 9, 10]] * torch.tensor([1, 1, 2, 4, 1, 1, 2, 4], device=piece.device)).sum(-1, keepdim=True) / 24
-        ep = batch.en_passant
-        state = torch.cat((
-            counts / 8, batch.castling.float(), batch.white_to_move.float()[:, None], phase,
-            (ep >= 0).float()[:, None], torch.where(ep >= 0, ep % 8, 0).float()[:, None] / 7,
-            torch.where(ep >= 0, ep // 8, 0).float()[:, None] / 7,
-            (batch.halfmove_clock / 100)[:, None], batch.repetition.float()[:, None],
-        ), -1)
-        head_input = [global_h, self.state_project(state)]
-        if self.raw_project is not None:
-            head_input.append(self.raw_project(raw_board_one_hot(piece)))
-        hidden = self.head(torch.cat(head_input, -1))
-        correction = self.value_head(hidden)
-        return Evaluation(material + correction, material, correction, self.wdl_head(hidden) if self.wdl_head is not None else None)
+    def _first_head(self, global_h: Tensor | None, piece: Tensor, state: Tensor) -> Tensor:
+        parts = ([global_h] if global_h is not None else []) + [state]
+        if not self.config.sparse_board_projection:
+            head_parts = ([global_h] if global_h is not None else []) + [raw_board_one_hot(piece).to(state.dtype), state]
+            return self.head[0](torch.cat(head_parts, -1))
+        # Exactly the same 832 first-layer weights, selected once per square.
+        first = self.head[0]
+        global_width = 0 if global_h is None else global_h.shape[-1]
+        nonboard_weight = torch.cat((first.weight[:, :global_width], first.weight[:, global_width + 832:]), -1)
+        base = F.linear(torch.cat(parts, -1), nonboard_weight, first.bias)
+        columns = 13 * torch.arange(64, device=piece.device)[None] + piece
+        board_weights = first.weight[:, global_width:global_width + 832].transpose(0, 1)
+        return base + board_weights[columns].sum(1)
 
-    def forward(self, batch: PositionBatch) -> Evaluation:
+    def forward(self, piece: Tensor | PositionBatch, side_to_move: Tensor | None = None,
+                castling: Tensor | None = None, en_passant: Tensor | None = None,
+                draw_state: Tensor | None = None) -> Tensor:
+        if isinstance(piece, PositionBatch):
+            batch = piece
+        else:
+            if side_to_move is None or castling is None or en_passant is None:
+                raise ValueError("side_to_move, castling and en_passant are required")
+            batch = PositionBatch(piece, side_to_move, castling, en_passant, draw_state)
         batch.validate()
-        original = self._forward_once(batch)
-        if not self.config.enforce_color_symmetry:
-            return original
-        swapped = self._forward_once(swap_colors_rotate(batch))
-        correction = (original.correction - swapped.correction) / 2
-        wdl = None
-        if original.wdl_logits is not None:
-            wdl = (original.wdl_logits + swapped.wdl_logits[:, [2, 1, 0]]) / 2
-        return Evaluation(original.material + correction, original.material, correction, wdl)
+        piece = batch.piece
+        state = self.state_encoder(batch.side_to_move, batch.castling,
+                                   batch.en_passant, batch.draw_state)
+        global_h = None
+        if self.encoder is not None:
+            initial = self.encoder(piece)
+            h = initial
+            if self.layers:
+                features, classes = self.geometry.edge_features(piece, self.edge_encoder.weight.dtype)
+                edges = self.edge_encoder(features)
+                for layer in self.layers:
+                    h = layer(h, state, edges, self.geometry, classes)
+            global_h = self.readout(h, initial)
+        return self.head[2](self.head[1](self._first_head(global_h, piece, state)))

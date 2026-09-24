@@ -101,13 +101,20 @@ class Fen(ctypes.Structure):
 
 
 class FenBatch(ctypes.Structure):
-    _fields_ = [("size", ctypes.c_int), ("fens", ctypes.POINTER(Fen))]
+    _fields_ = [
+        ("size", ctypes.c_int),
+        ("fens", ctypes.POINTER(Fen)),
+        ("scores", ctypes.POINTER(ctypes.c_int16)),
+    ]
 
     def get_fens(self):
         strings = []
         for i in range(self.size):
             strings.append(self.fens[i].fen.decode("utf-8"))
         return strings
+
+    def get_fens_and_scores(self):
+        return self.get_fens(), [int(self.scores[i]) for i in range(self.size)]
 
 
 class CDataLoaderAPI:
@@ -212,8 +219,8 @@ class CDataLoaderAPI:
         ]
 
 
-type SparseBatchPtr = ctypes._Pointer[SparseBatch]
-type FenBatchPtr = ctypes._Pointer[FenBatch]
+SparseBatchPtr = ctypes.POINTER(SparseBatch)
+FenBatchPtr = ctypes.POINTER(FenBatch)
 
 try:
     c_lib = CDataLoaderAPI()

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 #include <string>
 #include <memory>
@@ -134,6 +135,7 @@ struct FenBatch final {
 private:
     int m_size;
     Fen* m_fens;
+    std::int16_t* m_scores;
 };
 
 struct FenBatchStream final : Stream<FenBatch> {
@@ -165,4 +167,3 @@ private:
     static int calculate_num_reader_threads(int concurrency);
     static int calculate_num_worker_threads(int concurrency);
 };
-

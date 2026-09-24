@@ -31,7 +31,7 @@ def main() -> None:
         synchronize()
         start = time.perf_counter()
         for _ in range(args.iterations):
-            model.geometry.rays(batch.piece)
+            model.geometry.edge_features(batch.piece)
         synchronize()
         geometry_ms = 1000 * (time.perf_counter() - start) / args.iterations
         start = time.perf_counter()

@@ -60,6 +60,7 @@ class FenBatchProvider:
         batch_size=None,
         config: DataloaderSkipConfig | None = None,
         ddp_config: DataloaderDDPConfig = None,
+        include_scores: bool = False,
     ):
         self.filename = filename
         self.cyclic = cyclic
@@ -68,6 +69,7 @@ class FenBatchProvider:
         if config is None:
             config = DataloaderSkipConfig()
         self.config = config
+        self.include_scores = include_scores
 
         if batch_size:
             self.stream = stream.create_fen_batch_stream(
@@ -95,7 +97,10 @@ class FenBatchProvider:
         v = stream.fetch_next_fen_batch(self.stream)
 
         if v:
-            fens = v.contents.get_fens()
+            fens = (
+                v.contents.get_fens_and_scores()
+                if self.include_scores else v.contents.get_fens()
+            )
             stream.destroy_fen_batch(v)
             return fens
         else:

@@ -1,100 +1,85 @@
-"""Static chess geometry and vectorized occupancy-dependent ray relations."""
-
-from dataclasses import dataclass
+"""All 1,792 static candidate edges and occupancy-dependent edge features."""
 
 import torch
 from torch import Tensor, nn
-
-# Direction is from destination toward source. Opposite directions share a class.
-DIRECTIONS = ((0, 1), (1, 1), (1, 0), (1, -1), (0, -1), (-1, -1), (-1, 0), (-1, 1))
-
-
-@dataclass
-class RayFeatures:
-    source_piece: Tensor
-    destination_piece: Tensor
-    blocker_piece: Tensor
-    blocker_distance: Tensor
-    blocker_square: Tensor
-    blocker_count: Tensor
-    direct: Tensor
-    xray: Tensor
-    attack: Tensor
-    valid: Tensor
+from torch.nn import functional as F
 
 
 class BoardGeometry(nn.Module):
     def __init__(self):
         super().__init__()
-        ray = torch.full((64, 8, 7), -1, dtype=torch.long)
-        knight = torch.full((64, 8), -1, dtype=torch.long)
-        pawn = torch.full((64, 4), -1, dtype=torch.long)
-        king_neighbors = torch.full((64, 8), -1, dtype=torch.long)
-        knight_steps = ((1, 2), (2, 1), (2, -1), (1, -2), (-1, -2), (-2, -1), (-2, 1), (-1, 2))
-        # Pawn sources: two White sources below destination, then two Black sources above it.
-        pawn_steps = ((-1, -1), (1, -1), (-1, 1), (1, 1))
-        for square in range(64):
-            file, rank = square % 8, square // 8
-            for direction, (df, dr) in enumerate(DIRECTIONS):
-                for distance in range(1, 8):
-                    f, r = file + df * distance, rank + dr * distance
-                    if 0 <= f < 8 and 0 <= r < 8:
-                        ray[square, direction, distance - 1] = r * 8 + f
-                f, r = file + df, rank + dr
-                if 0 <= f < 8 and 0 <= r < 8:
-                    king_neighbors[square, direction] = r * 8 + f
-            for index, (df, dr) in enumerate(knight_steps):
-                f, r = file + df, rank + dr
-                if 0 <= f < 8 and 0 <= r < 8:
-                    knight[square, index] = r * 8 + f
-            for index, (df, dr) in enumerate(pawn_steps):
-                f, r = file + df, rank + dr
-                if 0 <= f < 8 and 0 <= r < 8:
-                    pawn[square, index] = r * 8 + f
-        self.register_buffer("ray_index", ray, persistent=False)
-        self.register_buffer("knight_index", knight, persistent=False)
-        self.register_buffer("pawn_index", pawn, persistent=False)
-        self.register_buffer("king_neighbors", king_neighbors, persistent=False)
+        sources, destinations, paths, masks, deltas, knights = [], [], [], [], [], []
+        for src in range(64):
+            sf, sr = src % 8, src // 8
+            for dst in range(64):
+                if src == dst:
+                    continue
+                df, dr = dst % 8 - sf, dst // 8 - sr
+                ray = df == 0 or dr == 0 or abs(df) == abs(dr)
+                knight = sorted((abs(df), abs(dr))) == [1, 2]
+                if not (ray or knight):
+                    continue
+                distance = max(abs(df), abs(dr))
+                step_f = (df > 0) - (df < 0)
+                step_r = (dr > 0) - (dr < 0)
+                path = [8 * (sr + k * step_r) + sf + k * step_f for k in range(1, distance)] if ray else []
+                sources.append(src)
+                destinations.append(dst)
+                paths.append(path + [0] * (6 - len(path)))
+                masks.append([True] * len(path) + [False] * (6 - len(path)))
+                deltas.append((df, dr))
+                knights.append(knight)
+        if len(sources) != 1792 or sum(knights) != 336:
+            raise AssertionError("unexpected edge topology")
+        self.register_buffer("src", torch.tensor(sources, dtype=torch.long))
+        self.register_buffer("dst", torch.tensor(destinations, dtype=torch.long))
+        self.register_buffer("between", torch.tensor(paths, dtype=torch.long))
+        self.register_buffer("between_mask", torch.tensor(masks, dtype=torch.bool))
+        self.register_buffer("relative_delta", torch.tensor(deltas, dtype=torch.long))
+        self.register_buffer("is_knight", torch.tensor(knights, dtype=torch.bool))
 
-    def rays(self, piece: Tensor) -> RayFeatures:
+    def edge_features(self, piece: Tensor, dtype: torch.dtype = torch.float32) -> tuple[Tensor, Tensor]:
+        """Return [B,1792,31] features and exclusive gate-bias class IDs."""
         b = piece.shape[0]
-        ray = self.ray_index
-        source = piece[:, ray.clamp_min(0)]
-        valid = (ray >= 0)[None].expand(b, -1, -1, -1)
-        occupied = (source != 0) & valid
-        # Prefix excludes both endpoints. A ray slot at distance one has no intervening squares.
-        count = torch.cat((torch.zeros_like(occupied[..., :1], dtype=torch.long), occupied.long().cumsum(-1)[..., :-1]), -1)
-        positions = torch.arange(1, 8, device=piece.device).view(1, 1, 1, 7)
-        last = torch.cummax(torch.where(occupied, positions, 0), -1).values
-        last = torch.cat((torch.zeros_like(last[..., :1]), last[..., :-1]), -1)
-        blocker = source.gather(-1, (last - 1).clamp_min(0))
-        blocker = torch.where(last > 0, blocker, 0)
-        blocker_square = ray[None].expand(b, -1, -1, -1).gather(-1, (last - 1).clamp_min(0))
-        blocker_square = torch.where(last > 0, blocker_square, -1)
-        destination = piece[:, :, None, None].expand_as(source)
-        direct = valid & (count == 0)
-        xray = valid & (count > 0)
-        kind = ((source - 1) % 6) + 1
-        orthogonal = torch.tensor([1, 0, 1, 0, 1, 0, 1, 0], device=piece.device, dtype=torch.bool)[None, None, :, None]
-        adjacent = positions == 1
-        slider = ((kind == 5) | (kind == 4) & orthogonal | (kind == 3) & ~orthogonal)
-        king = (kind == 6) & adjacent
-        # White pawns below a destination and Black pawns above it.
-        white_pawn = (source == 1) & torch.tensor([0, 0, 0, 1, 0, 1, 0, 0], device=piece.device, dtype=torch.bool)[None, None, :, None]
-        black_pawn = (source == 7) & torch.tensor([0, 1, 0, 0, 0, 0, 0, 1], device=piece.device, dtype=torch.bool)[None, None, :, None]
-        pawn = (white_pawn | black_pawn) & adjacent
-        attack = direct & (source != 0) & (slider | king | pawn)
-        return RayFeatures(source, destination, blocker, (positions - last).where(last > 0, 0).expand_as(source), blocker_square, count.clamp(max=2), direct, xray, attack, valid)
-
-    def jump_sources(self, piece: Tensor, relation: str) -> tuple[Tensor, Tensor, Tensor]:
-        index = self.knight_index if relation == "knight" else self.pawn_index
-        source = piece[:, index.clamp_min(0)]
-        if relation == "knight":
-            mask = (index >= 0)[None] & ((source == 2) | (source == 8))
-        elif relation == "pawn":
-            white = (source[..., :2] == 1)
-            black = (source[..., 2:] == 7)
-            mask = (index >= 0)[None] & torch.cat((white, black), -1)
-        else:
-            raise ValueError("relation must be knight or pawn")
-        return index.clamp_min(0), source, mask
+        interior = piece[:, self.between]
+        occupied = (interior != 0) & self.between_mask[None]
+        count = occupied.sum(-1)
+        present = count > 0
+        first_slot = occupied.to(torch.long).argmax(-1)
+        first_piece = interior.gather(-1, first_slot[..., None]).squeeze(-1)
+        first_piece = torch.where(present, first_piece, 0)
+        first_square = self.between[None].expand(b, -1, -1).gather(-1, first_slot[..., None]).squeeze(-1)
+        df, dr = self.relative_delta[:, 0], self.relative_delta[:, 1]
+        orthogonal = (df == 0) | (dr == 0)
+        diagonal = df.abs() == dr.abs()
+        adjacent = (df.abs() <= 1) & (dr.abs() <= 1)
+        source_piece = piece[:, self.src]
+        destination_piece = piece[:, self.dst]
+        kind = torch.where(source_piece > 6, source_piece - 6, source_piece)
+        pawn_attack = (kind == 1) & (df.abs()[None] == 1) & (
+            ((source_piece <= 6) & (dr[None] == 1)) |
+            ((source_piece > 6) & (dr[None] == -1)))
+        geometry = ((kind == 4) & orthogonal[None]) | ((kind == 3) & diagonal[None])
+        geometry = geometry | ((kind == 5) & ~self.is_knight[None])
+        geometry = geometry | ((kind == 2) & self.is_knight[None])
+        geometry = geometry | ((kind == 6) & adjacent[None]) | pawn_attack
+        geometry = geometry & (source_piece != 0)
+        direct = geometry & ~present
+        src_rank = self.src // 8
+        pawn_forward = (kind == 1) & (df[None] == 0) & (
+            ((source_piece <= 6) & ((dr[None] == 1) | ((src_rank[None] == 1) & (dr[None] == 2)))) |
+            ((source_piece > 6) & ((dr[None] == -1) | ((src_rank[None] == 6) & (dr[None] == -2)))))
+        first_delta = torch.stack((first_square % 8 - self.src[None] % 8,
+                                   first_square // 8 - self.src[None] // 8), -1)
+        first_delta = torch.where(present[..., None], first_delta, 0)
+        relative = self.relative_delta.to(dtype)[None].expand(b, -1, -1) / 7
+        features = torch.cat((
+            relative, self.is_knight.to(dtype)[None, :, None].expand(b, -1, -1),
+            F.one_hot(count, 7).to(dtype), F.one_hot(first_piece, 13).to(dtype),
+            first_delta.to(dtype) / 7, present[..., None].to(dtype),
+            geometry[..., None].to(dtype), direct[..., None].to(dtype),
+            (source_piece != 0)[..., None].to(dtype), (destination_piece != 0)[..., None].to(dtype),
+            pawn_forward[..., None].to(dtype),
+        ), -1)
+        classes = torch.where(direct, 0, torch.where(source_piece != 0, 1, 2))
+        return features, classes
