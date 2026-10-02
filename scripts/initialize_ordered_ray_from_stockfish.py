@@ -55,7 +55,7 @@ def main() -> None:
     candidate.model.input.features[1].weight.data.copy_(
         baseline.model.input.features[1].weight.data
     )
-    candidate.model.input.features[2].weight.data.zero_()
+    candidate.model.input.features[2].gate.data.zero_()
     candidate.model.input.features[3].load_export_weights(
         baseline.model.input.features[2].get_export_weights()
     )
@@ -66,7 +66,10 @@ def main() -> None:
 
     # Fail closed: before training, the expanded model must be exactly the
     # parent model plus a zero-contribution OrderedRay2 block.
-    assert torch.count_nonzero(candidate.model.input.features[2].weight) == 0
+    ray = candidate.model.input.features[2]
+    assert torch.count_nonzero(ray.weight) > 0
+    assert ray.gate.item() == 0.0
+    assert torch.count_nonzero(ray.merged_weight()) == 0
     assert torch.equal(candidate.model.input.bias, baseline.model.input.bias)
     assert torch.equal(
         candidate.model.input.features[0].weight,

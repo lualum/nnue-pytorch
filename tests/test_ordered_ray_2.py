@@ -1,6 +1,7 @@
 from collections import Counter
 
 import data_loader
+import torch
 from model.modules.features import OrderedRay2, get_available_features
 
 
@@ -74,3 +75,23 @@ def test_requires_two_occupied_squares_beyond_slider():
     white, black = _features("7k/8/8/8/8/8/8/R3K3 w - - 0 1")
     assert white == []
     assert black == []
+
+
+def test_zero_gate_is_exact_and_export_folds_gate():
+    feature = OrderedRay2(4)
+    assert torch.count_nonzero(feature.weight) > 0
+    assert feature.gate.item() == 0.0
+    assert torch.count_nonzero(feature.merged_weight()) == 0
+    assert torch.count_nonzero(feature.get_export_weights()) == 0
+
+    with torch.no_grad():
+        feature.gate.fill_(0.25)
+    assert torch.equal(feature.get_export_weights(), feature.weight * 0.25)
+
+
+def test_loading_exported_ray_weights_opens_folded_gate():
+    feature = OrderedRay2(2)
+    exported = torch.randn_like(feature.weight)
+    feature.load_export_weights(exported)
+    assert feature.gate.item() == 1.0
+    assert torch.equal(feature.merged_weight(), exported)

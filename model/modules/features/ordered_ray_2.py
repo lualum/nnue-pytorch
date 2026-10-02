@@ -26,10 +26,13 @@ class OrderedRay2(InputFeature):
         self.weight = nn.Parameter(
             torch.empty(self.NUM_INPUTS, num_outputs, dtype=torch.float32)
         )
+        # ReZero-style scalar. The ray table can have useful nonzero gradients
+        # while its initial contribution to the parent network is exactly zero.
+        self.gate = nn.Parameter(torch.zeros((), dtype=torch.float32))
         self.reset_parameters()
 
     def merged_weight(self) -> torch.Tensor:
-        return self.weight
+        return self.weight * self.gate
 
     @torch.no_grad()
     def coalesce(self) -> None:
@@ -45,11 +48,13 @@ class OrderedRay2(InputFeature):
 
     @torch.no_grad()
     def get_export_weights(self) -> torch.Tensor:
-        return self.weight.data.clone()
+        # Stockfish needs no gate-aware file format: fold it into the table.
+        return (self.weight.data * self.gate.data).clone()
 
     @torch.no_grad()
     def load_export_weights(self, export_weight: torch.Tensor) -> None:
         self.weight.data.copy_(export_weight)
+        self.gate.data.fill_(1.0)
 
     def clip_weights(self, quantization) -> None:
         self.weight.data.clamp_(

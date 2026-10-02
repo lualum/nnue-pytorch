@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import copy
 import csv
 import json
 import math
@@ -49,6 +50,23 @@ def final_metrics(path):
     return final
 
 
+def best_validation_checkpoint(version):
+    candidates = []
+    with (version / "metrics.csv").open(newline="", encoding="utf-8") as source:
+        for row in csv.DictReader(source):
+            if row.get("val_loss_epoch") and row.get("epoch"):
+                candidates.append((float(row["val_loss_epoch"]), int(row["epoch"])))
+    if not candidates:
+        return version / "checkpoints" / "last.ckpt", final_metrics(version / "metrics.csv")
+    val_loss, epoch = min(candidates)
+    matches = list((version / "checkpoints").glob(f"epoch={epoch}-step=*.ckpt"))
+    checkpoint = matches[0] if len(matches) == 1 else version / "checkpoints" / "last.ckpt"
+    metrics = final_metrics(version / "metrics.csv")
+    metrics["val_loss_epoch"] = val_loss
+    metrics["selected_epoch"] = epoch
+    return checkpoint, metrics
+
+
 def train(repo, output, name, features, model, gpu, args):
     root = output / name
     env = os.environ.copy()
@@ -61,20 +79,50 @@ def train(repo, output, name, features, model, gpu, args):
         f"--threads={args.threads}", f"--num-workers={args.workers}",
         f"--batch-size={args.batch_size}", f"--epoch-size={args.epoch_size}",
         f"--validation-size={args.validation_size}", f"--max-epochs={args.epochs}",
-        "--network-save-period=1000000", "--save-last-network=True",
+        f"--network-save-period={args.network_save_period}", "--save-last-network=True",
         f"--default-root-dir={root}", f"--features={features}",
         f"--resume-from-model={model}", f"--seed={args.seed}",
-        "--optimizer-name=adamw",
+        "--optimizer-name=adamw", f"--lr={args.learning_rate}",
     ]
     started = time.monotonic()
     run(cmd, cwd=repo, env=env, log=output / f"{name}-training.log")
     elapsed = time.monotonic() - started
     version = root / "training_logs" / "version_0"
+    checkpoint, metrics = best_validation_checkpoint(version)
     return {
         "elapsed_seconds": elapsed,
-        **final_metrics(version / "metrics.csv"),
-        "checkpoint": str(version / "checkpoints" / "last.ckpt"),
+        **metrics,
+        "checkpoint": str(checkpoint),
     }
+
+
+def train_candidate_staged(repo, output, init_candidate, args):
+    warmup_model = output / "candidate-ray-warmup-init.pt"
+    run([
+        sys.executable, "scripts/prepare_ordered_ray_phase.py",
+        init_candidate, warmup_model, "--freeze-inherited",
+    ], cwd=repo)
+    warmup_args = copy.copy(args)
+    warmup_args.epochs = 1
+    warmup_args.epoch_size = args.ray_warmup_size
+    warmup_args.validation_size = min(args.validation_size, 250_000)
+    warmup_args.learning_rate = args.ray_warmup_learning_rate
+    warmup_args.network_save_period = 1
+    warmup = train(
+        repo, output, "candidate_ray_warmup", CANDIDATE_FEATURES,
+        warmup_model, 1, warmup_args,
+    )
+    finetune_model = output / "candidate-finetune-init.pt"
+    run([
+        sys.executable, "scripts/prepare_ordered_ray_phase.py",
+        init_candidate, finetune_model, "--checkpoint", warmup["checkpoint"],
+    ], cwd=repo)
+    candidate = train(
+        repo, output, "candidate", CANDIDATE_FEATURES,
+        finetune_model, 1, args,
+    )
+    candidate["ray_warmup"] = warmup
+    return candidate
 
 
 def parse_bench(text):
@@ -167,6 +215,10 @@ def main():
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--games", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=20261002)
+    parser.add_argument("--learning-rate", type=float, default=4.375e-5)
+    parser.add_argument("--ray-warmup-size", type=int, default=5_000_000)
+    parser.add_argument("--ray-warmup-learning-rate", type=float, default=8.75e-4)
+    parser.add_argument("--network-save-period", type=int, default=1)
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[1]
     output = args.output.resolve()
@@ -196,7 +248,7 @@ def main():
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         b = pool.submit(train, repo, output, "baseline", BASELINE_FEATURES, init_baseline, 0, args)
-        c = pool.submit(train, repo, output, "candidate", CANDIDATE_FEATURES, init_candidate, 1, args)
+        c = pool.submit(train_candidate_staged, repo, output, init_candidate, args)
         baseline = b.result()
         candidate = c.result()
 
