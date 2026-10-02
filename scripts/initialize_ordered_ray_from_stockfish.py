@@ -64,6 +64,24 @@ def main() -> None:
         baseline.model.layer_stacks.state_dict()
     )
 
+    # Fail closed: before training, the expanded model must be exactly the
+    # parent model plus a zero-contribution OrderedRay2 block.
+    assert torch.count_nonzero(candidate.model.input.features[2].weight) == 0
+    assert torch.equal(candidate.model.input.bias, baseline.model.input.bias)
+    assert torch.equal(
+        candidate.model.input.features[0].weight,
+        baseline.model.input.features[0].weight,
+    )
+    assert torch.equal(
+        candidate.model.input.features[1].weight,
+        baseline.model.input.features[1].weight,
+    )
+    assert torch.equal(
+        candidate.model.input.features[3].get_export_weights(),
+        baseline.model.input.features[2].get_export_weights(),
+    )
+    print("Verified exact parent copy with zero-gated OrderedRay2 weights.", flush=True)
+
     args.baseline.parent.mkdir(parents=True, exist_ok=True)
     args.candidate.parent.mkdir(parents=True, exist_ok=True)
     torch.save(baseline, args.baseline)

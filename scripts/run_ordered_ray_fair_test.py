@@ -154,6 +154,11 @@ def main():
     parser.add_argument("--validation-data", required=True)
     parser.add_argument("--output", type=Path, default=Path("ordered_ray_fair_test"))
     parser.add_argument("--engine-patch", type=Path, required=True)
+    parser.add_argument(
+        "--initial-network",
+        type=Path,
+        help="Warm-start .nnue; defaults to the official Stockfish network.",
+    )
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--epoch-size", type=int, default=20_000_000)
     parser.add_argument("--validation-size", type=int, default=1_000_000)
@@ -175,8 +180,16 @@ def main():
     run(["cmake", "--build", "build", "-j2"], cwd=repo)
     run([sys.executable, "-m", "pytest", "-q", "tests/test_ordered_ray_2.py"], cwd=repo)
 
-    official_net = output / OFFICIAL_NET
-    run(["curl", "-L", "-o", official_net, f"https://tests.stockfishchess.org/api/nn/{OFFICIAL_NET}"], cwd=repo)
+    if args.initial_network:
+        official_net = args.initial_network.resolve()
+        if not official_net.is_file():
+            raise RuntimeError(f"Initial network does not exist: {official_net}")
+        initial_network_name = official_net.name
+        print(f"Warm-starting both arms from {official_net}", flush=True)
+    else:
+        official_net = output / OFFICIAL_NET
+        run(["curl", "-L", "-o", official_net, f"https://tests.stockfishchess.org/api/nn/{OFFICIAL_NET}"], cwd=repo)
+        initial_network_name = OFFICIAL_NET
     init_baseline = output / "baseline-init.pt"
     init_candidate = output / "candidate-init.pt"
     run([sys.executable, "scripts/initialize_ordered_ray_from_stockfish.py", official_net, init_baseline, init_candidate], cwd=repo)
@@ -223,7 +236,7 @@ def main():
     results = {
         "experiment": "OrderedRay2 matched Stockfish ablation",
         "stockfish_commit": STOCKFISH_COMMIT,
-        "initial_network": OFFICIAL_NET,
+        "initial_network": initial_network_name,
         "hardware": {"gpus": [torch.cuda.get_device_name(i) for i in range(2)], "cpu_count": os.cpu_count(), "platform": platform.platform()},
         "config": vars(args) | {"output": str(output), "engine_patch": str(args.engine_patch)},
         "baseline": baseline,
@@ -232,7 +245,7 @@ def main():
         "bench": {"baseline": baseline_bench, "candidate": candidate_bench, "nps_delta_percent": 100 * (candidate_bench["nps"] / baseline_bench["nps"] - 1)},
         "matches": matches,
         "method": [
-            "Both nets start from the same official Stockfish network; OrderedRay2 starts at zero.",
+            "Both nets start from the same parent network; OrderedRay2 starts at exactly zero contribution.",
             "Both see the same training positions, optimizer, seed, batch count, and separate held-out validation source.",
             "Openings are repeated with colors swapped; equal-node isolates net quality and equal-time includes feature overhead.",
         ],
