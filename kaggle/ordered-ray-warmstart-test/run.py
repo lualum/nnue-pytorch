@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 REPOSITORY = "https://github.com/lualum/nnue-pytorch.git"
-EXPERIMENT_COMMIT = "0e889967ae3ce149fc81c91d3aba6edad959c6ec"
+EXPERIMENT_COMMIT = "9f4ef1889e873154f6cb22e12155c183c0bb1921"
 PARENT_SHA256 = "e0d2a2956c39264b135bd78d4fc19a33f75edfb8d13f806c4daeaabd8ab38457"
 
 
@@ -57,7 +57,11 @@ run([
     "--output=/kaggle/working/ordered_ray_warmstart_test",
     "--threads=2",
     "--workers=2",
-    "--epoch-size=20000000",
+    "--epochs=4",
+    "--epoch-size=5000000",
     "--validation-size=1000000",
+    "--learning-rate=0.00004375",
+    "--ray-warmup-size=5000000",
+    "--ray-warmup-learning-rate=0.000875",
     "--games=1000",
 ], cwd=repo)
