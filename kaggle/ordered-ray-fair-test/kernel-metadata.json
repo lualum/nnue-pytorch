@@ -1,0 +1,18 @@
+{
+  "id": "cogniplayapp/nnue-ordered-ray-fair-stockfish-test",
+  "title": "NNUE Ordered Ray Fair Stockfish Test",
+  "code_file": "run.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_internet": "true",
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": [
+    "joostvandevondele/wrongisright-u-nodes5000pv2",
+    "linrock/dfrc-data-fragments"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}
