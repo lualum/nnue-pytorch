@@ -227,6 +227,13 @@ def main():
     per_gpu_batch_size = global_batch_size_requested // n_devices
     feature_name = args.nnue_config.features
 
+    # Seed before model construction so matched experiments receive identical
+    # compatible initial weights. Previously the seed was applied only after
+    # every parameter had already been initialized.
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+
     max_epoch = args.max_epochs or 800
     if args.resume_from_model is None:
         nnue = M.NNUE(
@@ -255,9 +262,6 @@ def main():
 
     input_feature_name = nnue.model.input_feature_name
 
-    torch.manual_seed(args.seed)
-    random.seed(args.seed)
-    np.random.seed(args.seed)
     torch.backends.cudnn.benchmark = True
 
     logdir = args.default_root_dir if args.default_root_dir else "logs/"

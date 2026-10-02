@@ -303,6 +303,167 @@ struct FullThreatsExtractor: IFeatureExtractor {
     }
 };
 
+struct OrderedRay2 {
+    static constexpr std::string_view NAME = "OrderedRay2";
+
+    static constexpr int INPUTS = 2 * 16 * 12 * 12 * 3 * 3;
+    // A legal position has at most 30 non-king pieces. If all are promoted
+    // queens, each can emit at most eight ordered rays.
+    static constexpr int MAX_ACTIVE_FEATURES = 240;
+
+    struct Direction {
+        int file;
+        int rank;
+    };
+
+    // Diagonals first, then orthogonals. Type-specific direction slots are
+    // bishop [0, 4), rook [4, 8), and queen [8, 16).
+    static constexpr Direction directions[8] = {
+      {1, 1}, {-1, 1}, {1, -1}, {-1, -1},
+      {1, 0}, {-1, 0}, {0, 1},  {0, -1}
+    };
+
+    static int distance_bucket(int distance) {
+        if (distance == 1)
+            return 0;
+        if (distance <= 3)
+            return 1;
+        return 2;
+    }
+
+    static int direction_index(int file_delta, int rank_delta) {
+        file_delta = (file_delta > 0) - (file_delta < 0);
+        rank_delta = (rank_delta > 0) - (rank_delta < 0);
+        for (int i = 0; i < 8; ++i)
+            if (directions[i].file == file_delta && directions[i].rank == rank_delta)
+                return i;
+        return -1;
+    }
+
+    static int piece_code(Color perspective, Piece piece) {
+        int relative_color = static_cast<int>(piece.color()) ^ static_cast<int>(perspective);
+        return relative_color * 6 + static_cast<int>(piece.type());
+    }
+
+    static int make_index(Color perspective,
+                          Piece source,
+                          Square source_sq,
+                          Piece blocker,
+                          Square blocker_sq,
+                          Piece target,
+                          Square target_sq,
+                          Square ksq) {
+        int orient = static_cast<int>(FullThreats::OrientTBL[static_cast<int>(perspective)]
+                                                             [static_cast<int>(ksq)]);
+        Square oriented_source = static_cast<Square>(static_cast<int>(source_sq) ^ orient);
+        Square oriented_blocker = static_cast<Square>(static_cast<int>(blocker_sq) ^ orient);
+
+        int direction = direction_index(
+          oriented_blocker.file() - oriented_source.file(),
+          oriented_blocker.rank() - oriented_source.rank());
+
+        int source_direction;
+        if (source.type() == PieceType::Bishop)
+            source_direction = direction;
+        else if (source.type() == PieceType::Rook)
+            source_direction = 4 + (direction - 4);
+        else
+            source_direction = 8 + direction;
+
+        int source_relative_color =
+          static_cast<int>(source.color()) ^ static_cast<int>(perspective);
+        int blocker_code = piece_code(perspective, blocker);
+        int target_code = piece_code(perspective, target);
+
+        int source_to_blocker = std::max(
+          std::abs(blocker_sq.file() - source_sq.file()),
+          std::abs(blocker_sq.rank() - source_sq.rank()));
+        int blocker_to_target = std::max(
+          std::abs(target_sq.file() - blocker_sq.file()),
+          std::abs(target_sq.rank() - blocker_sq.rank()));
+
+        int index = source_relative_color;
+        index = index * 16 + source_direction;
+        index = index * 12 + blocker_code;
+        index = index * 12 + target_code;
+        index = index * 3 + distance_bucket(source_to_blocker);
+        index = index * 3 + distance_bucket(blocker_to_target);
+        return index;
+    }
+
+    static std::pair<int, int>
+    fill_features_sparse(const TrainingDataEntry& e, int* features, Color perspective) {
+        auto& pos = e.pos;
+        auto ksq = pos.kingSquare(perspective);
+        int written = 0;
+
+        for (int color_id = static_cast<int>(Color::White);
+             color_id <= static_cast<int>(Color::Black);
+             ++color_id)
+        {
+            Color color = static_cast<Color>(color_id);
+            for (int type_id = static_cast<int>(PieceType::Bishop);
+                 type_id <= static_cast<int>(PieceType::Queen);
+                 ++type_id)
+            {
+                PieceType type = static_cast<PieceType>(type_id);
+                Piece source(type, color);
+                int first_direction = type == PieceType::Rook ? 4 : 0;
+                int last_direction = type == PieceType::Bishop ? 4 : 8;
+
+                for (Square source_sq : pos.piecesBB(source))
+                {
+                    for (int direction = first_direction; direction < last_direction; ++direction)
+                    {
+                        Square occupied[2];
+                        int occupied_count = 0;
+                        int file = static_cast<int>(source_sq.file()) + directions[direction].file;
+                        int rank = static_cast<int>(source_sq.rank()) + directions[direction].rank;
+
+                        while (file >= 0 && file < 8 && rank >= 0 && rank < 8)
+                        {
+                            Square square = static_cast<Square>(rank * 8 + file);
+                            if (pos.pieceAt(square) != Piece::none())
+                            {
+                                occupied[occupied_count++] = square;
+                                if (occupied_count == 2)
+                                    break;
+                            }
+                            file += directions[direction].file;
+                            rank += directions[direction].rank;
+                        }
+
+                        if (occupied_count == 2)
+                        {
+                            features[written++] = make_index(
+                              perspective,
+                              source,
+                              source_sq,
+                              pos.pieceAt(occupied[0]),
+                              occupied[0],
+                              pos.pieceAt(occupied[1]),
+                              occupied[1],
+                              ksq);
+                        }
+                    }
+                }
+            }
+        }
+
+        return {written, INPUTS};
+    }
+};
+
+struct OrderedRay2Extractor: IFeatureExtractor {
+    int inputs() const override { return OrderedRay2::INPUTS; }
+    int max_active_features() const override { return OrderedRay2::MAX_ACTIVE_FEATURES; }
+    std::pair<int, int> fill_features_sparse(const TrainingDataEntry& e,
+                                             int* features,
+                                             Color color) const override {
+        return OrderedRay2::fill_features_sparse(e, features, color);
+    }
+};
+
 struct PP_3Wide {
     static constexpr std::string_view NAME = "PP_3Wide";
 
@@ -435,6 +596,8 @@ static std::unique_ptr<IFeatureExtractor> make_single_extractor(std::string_view
         return std::make_unique<HalfKAv2_hmExtractor>();
     if (name == "Full_Threats")
         return std::make_unique<FullThreatsExtractor>();
+    if (name == "OrderedRay2")
+        return std::make_unique<OrderedRay2Extractor>();
     if (name == "PP_3Wide")
         return std::make_unique<PP_3WideExtractor>();
     return nullptr;

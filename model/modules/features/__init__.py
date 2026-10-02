@@ -8,11 +8,13 @@ import tyro
 from .full_threats import FullThreats
 from .halfka_v2_hm import HalfKav2Hm
 from .input_feature import InputFeature
+from .ordered_ray_2 import OrderedRay2
 from .pp_3wide import PP3Wide
 
 _FEATURE_COMPONENTS: dict[str, type[InputFeature]] = {
     "HalfKAv2_hm^": HalfKav2Hm,
     "Full_Threats": FullThreats,
+    "OrderedRay2": OrderedRay2,
     "PP_3Wide": PP3Wide,
 }
 
@@ -56,6 +58,7 @@ __all__ = [
     "FullThreats",
     "HalfKav2Hm",
     "InputFeature",
+    "OrderedRay2",
     "PP3Wide",
     "add_feature_args",
     "get_available_features",

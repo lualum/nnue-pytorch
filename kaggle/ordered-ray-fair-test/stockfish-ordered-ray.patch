@@ -1,0 +1,382 @@
+diff --git a/src/Makefile b/src/Makefile
+index 4285d87..fec78e4 100644
+--- a/src/Makefile
++++ b/src/Makefile
+@@ -80,13 +80,13 @@ SRCS = attacks.cpp benchmark.cpp bitboard.cpp evaluate.cpp main.cpp \
+ 	misc.cpp movegen.cpp movepick.cpp position.cpp \
+ 	search.cpp thread.cpp timeman.cpp tt.cpp uci.cpp ucioption.cpp tune.cpp syzygy/tbprobe.cpp \
+ 	nnue/nnue_accumulator.cpp nnue/nnue_misc.cpp nnue/network.cpp \
+-	nnue/features/half_ka_v2_hm.cpp nnue/features/full_threats.cpp nnue/features/pp_3wide.cpp \
++	nnue/features/half_ka_v2_hm.cpp nnue/features/full_threats.cpp nnue/features/pp_3wide.cpp nnue/features/ordered_ray_2.cpp \
+ 	engine.cpp score.cpp memory.cpp
+ 
+ OTHER_SRCS = universal/entry_x86.cpp universal/entry_arm64.cpp universal/entry_riscv64.cpp universal/nnue_embed.cpp
+ 
+ HEADERS = attacks.h benchmark.h bitboard.h evaluate.h misc.h movegen.h movepick.h history.h \
+-		nnue/nnue_misc.h nnue/features/half_ka_v2_hm.h nnue/features/full_threats.h \
++		nnue/nnue_misc.h nnue/features/half_ka_v2_hm.h nnue/features/full_threats.h nnue/features/ordered_ray_2.h \
+ 		nnue/features/pp_3wide.h nnue/layers/affine_transform.h nnue/layers/affine_transform_sparse_input.h \
+ 		nnue/layers/clipped_relu.h nnue/layers/sqr_clipped_relu.h nnue/nnue_accumulator.h \
+ 		nnue/nnue_architecture.h nnue/nnue_common.h nnue/nnue_feature_transformer.h nnue/simd.h \
+diff --git a/src/nnue/features/full_threats.h b/src/nnue/features/full_threats.h
+index f55e9f1..0bdb976 100644
+--- a/src/nnue/features/full_threats.h
++++ b/src/nnue/features/full_threats.h
+@@ -66,7 +66,7 @@ class FullThreats {
+     // clang-format on
+ 
+     // Maximum number of simultaneously active features.
+-    using IndexList = ValueList<u16, 256>;
++    using IndexList = ValueList<u32, 768>;
+     using DiffType  = DirtyThreats;
+ 
+     static IndexType
+diff --git a/src/nnue/features/ordered_ray_2.cpp b/src/nnue/features/ordered_ray_2.cpp
+new file mode 100644
+index 0000000..a366cfd
+--- /dev/null
++++ b/src/nnue/features/ordered_ray_2.cpp
+@@ -0,0 +1,119 @@
++#include "ordered_ray_2.h"
++
++#include <algorithm>
++#include <vector>
++
++#include "../../position.h"
++#include "full_threats.h"
++
++namespace Stockfish::Eval::NNUE::Features {
++
++namespace {
++
++constexpr int Dirs[8][2] = {
++  {1, 1}, {-1, 1}, {1, -1}, {-1, -1}, {1, 0}, {-1, 0}, {0, 1}, {0, -1}};
++
++int bucket(int d) { return d == 1 ? 0 : d <= 3 ? 1 : 2; }
++
++int direction_index(int df, int dr) {
++    df = (df > 0) - (df < 0);
++    dr = (dr > 0) - (dr < 0);
++    for (int i = 0; i < 8; ++i)
++        if (Dirs[i][0] == df && Dirs[i][1] == dr)
++            return i;
++    return -1;
++}
++
++int piece_code(Color perspective, Piece piece) {
++    return int(color_of(piece) ^ perspective) * 6 + int(type_of(piece)) - 1;
++}
++
++u32 make_index(Color perspective, Piece source, Square sourceSq, Piece blocker,
++               Square blockerSq, Piece target, Square targetSq, Square ksq) {
++    const int orient = FullThreats::OrientTBL[ksq] ^ (56 * perspective);
++    const Square orientedSource = Square(int(sourceSq) ^ orient);
++    const Square orientedBlocker = Square(int(blockerSq) ^ orient);
++    const int dir = direction_index(file_of(orientedBlocker) - file_of(orientedSource),
++                                    rank_of(orientedBlocker) - rank_of(orientedSource));
++    const int sourceDir = type_of(source) == BISHOP ? dir : type_of(source) == ROOK ? 4 + dir - 4
++                                                                                   : 8 + dir;
++    const int d1 = std::max(std::abs(file_of(blockerSq) - file_of(sourceSq)),
++                            std::abs(rank_of(blockerSq) - rank_of(sourceSq)));
++    const int d2 = std::max(std::abs(file_of(targetSq) - file_of(blockerSq)),
++                            std::abs(rank_of(targetSq) - rank_of(blockerSq)));
++    u32 idx = color_of(source) ^ perspective;
++    idx = idx * 16 + sourceDir;
++    idx = idx * 12 + piece_code(perspective, blocker);
++    idx = idx * 12 + piece_code(perspective, target);
++    idx = idx * 3 + bucket(d1);
++    idx = idx * 3 + bucket(d2);
++    return OrderedRay2::IndexBase + idx;
++}
++
++template<typename PieceAt>
++void generate(Color perspective, Square ksq, PieceAt pieceAt, OrderedRay2::IndexList& out) {
++    for (Square sourceSq = SQ_A1; sourceSq <= SQ_H8; ++sourceSq)
++    {
++        const Piece source = pieceAt(sourceSq);
++        if (source == NO_PIECE || (type_of(source) != BISHOP && type_of(source) != ROOK
++                                   && type_of(source) != QUEEN))
++            continue;
++        const int first = type_of(source) == ROOK ? 4 : 0;
++        const int last  = type_of(source) == BISHOP ? 4 : 8;
++        for (int dir = first; dir < last; ++dir)
++        {
++            Square occupied[2];
++            int n = 0;
++            int file = file_of(sourceSq) + Dirs[dir][0];
++            int rank = rank_of(sourceSq) + Dirs[dir][1];
++            while (file >= 0 && file < 8 && rank >= 0 && rank < 8)
++            {
++                const Square sq = make_square(File(file), Rank(rank));
++                if (pieceAt(sq) != NO_PIECE)
++                {
++                    occupied[n++] = sq;
++                    if (n == 2)
++                        break;
++                }
++                file += Dirs[dir][0];
++                rank += Dirs[dir][1];
++            }
++            if (n == 2)
++                out.push_back(make_index(perspective, source, sourceSq, pieceAt(occupied[0]),
++                                         occupied[0], pieceAt(occupied[1]), occupied[1], ksq));
++        }
++    }
++}
++
++}  // namespace
++
++void OrderedRay2::append_active_indices(Color perspective, const Position& pos, IndexList& active) {
++    generate(perspective, pos.square<KING>(perspective),
++             [&](Square sq) { return pos.piece_on(sq); }, active);
++}
++
++void OrderedRay2::append_changed_indices(Color perspective, Square ksq, const DirtyRays& diff,
++                                         IndexList& removed, IndexList& added) {
++    IndexList before, after;
++    generate(perspective, ksq, [&](Square sq) { return diff.before[sq]; }, before);
++    generate(perspective, ksq, [&](Square sq) { return diff.after[sq]; }, after);
++    std::vector<u32> beforeSorted(before.begin(), before.end());
++    std::vector<u32> afterSorted(after.begin(), after.end());
++    std::sort(beforeSorted.begin(), beforeSorted.end());
++    std::sort(afterSorted.begin(), afterSorted.end());
++    auto b = beforeSorted.begin(), a = afterSorted.begin();
++    while (b != beforeSorted.end() || a != afterSorted.end())
++    {
++        if (a == afterSorted.end() || (b != beforeSorted.end() && *b < *a))
++            removed.push_back(*b++);
++        else if (b == beforeSorted.end() || *a < *b)
++            added.push_back(*a++);
++        else
++        {
++            ++a;
++            ++b;
++        }
++    }
++}
++
++}  // namespace Stockfish::Eval::NNUE::Features
+diff --git a/src/nnue/features/ordered_ray_2.h b/src/nnue/features/ordered_ray_2.h
+new file mode 100644
+index 0000000..d873025
+--- /dev/null
++++ b/src/nnue/features/ordered_ray_2.h
+@@ -0,0 +1,35 @@
++/* Ordered two-occupant slider-ray NNUE feature. */
++
++#ifndef NNUE_FEATURES_ORDERED_RAY_2_INCLUDED
++#define NNUE_FEATURES_ORDERED_RAY_2_INCLUDED
++
++#include <array>
++
++#include "../../misc.h"
++#include "../../types.h"
++#include "../nnue_common.h"
++
++namespace Stockfish {
++class Position;
++}
++
++namespace Stockfish::Eval::NNUE::Features {
++
++class OrderedRay2 {
++   public:
++    static constexpr u32 HashValue = 0xA8D12F37u;
++    static constexpr IndexType Dimensions = 2 * 16 * 12 * 12 * 3 * 3;
++    static constexpr IndexType IndexBase = 59808 + 4560;
++
++    using IndexList = ValueList<u32, 768>;
++    using Board = std::array<Piece, SQUARE_NB>;
++
++    static void append_active_indices(Color perspective, const Position& pos, IndexList& active);
++    static void append_changed_indices(Color perspective, Square ksq,
++                                       const DirtyRays& diff, IndexList& removed,
++                                       IndexList& added);
++};
++
++}  // namespace Stockfish::Eval::NNUE::Features
++
++#endif
+diff --git a/src/nnue/features/pp_3wide.h b/src/nnue/features/pp_3wide.h
+index 9ff1559..370b6b9 100644
+--- a/src/nnue/features/pp_3wide.h
++++ b/src/nnue/features/pp_3wide.h
+@@ -39,7 +39,7 @@ class PP_3Wide {
+     // Pawn pair feature indices are concatenated to threats, so this must equal ThreatFeatureSet::Dimensions;
+     // see nnue_feature_transformer.h
+     static constexpr IndexType IndexBase = 59808;
+-    using IndexList                      = ValueList<u16, 256>;
++    using IndexList                      = ValueList<u32, 768>;
+     using DiffType                       = DirtyPawnPairs;
+ 
+     static IndexType make_index(
+diff --git a/src/nnue/nnue_accumulator.cpp b/src/nnue/nnue_accumulator.cpp
+index 2b2c9fc..1febccc 100644
+--- a/src/nnue/nnue_accumulator.cpp
++++ b/src/nnue/nnue_accumulator.cpp
+@@ -469,6 +469,8 @@ void update_accumulator_incremental(Color                     perspective,
+                                                  thrAdded, threatPpBase, pfStride);
+         PairFeatureSet::append_changed_indices(perspective, ksq, dirtyPawnPairs, thrRemoved,
+                                                thrAdded, threatPpBase, pfStride);
++        RayFeatureSet::append_changed_indices(perspective, ksq, target_state.dirtyRays, thrRemoved,
++                                              thrAdded);
+         PSQFeatureSet::append_changed_indices(perspective, ksq, dirtyPiece, psqRemoved, psqAdded);
+     }
+     else
+@@ -477,6 +479,8 @@ void update_accumulator_incremental(Color                     perspective,
+                                                  thrRemoved, threatPpBase, pfStride);
+         PairFeatureSet::append_changed_indices(perspective, ksq, dirtyPawnPairs, thrAdded,
+                                                thrRemoved, threatPpBase, pfStride);
++        RayFeatureSet::append_changed_indices(perspective, ksq, computed.dirtyRays, thrAdded,
++                                              thrRemoved);
+         PSQFeatureSet::append_changed_indices(perspective, ksq, dirtyPiece, psqAdded, psqRemoved);
+     }
+ 
+@@ -509,6 +513,10 @@ void update_accumulator_incremental_both(const FeatureTransformer& featureTransf
+     PairFeatureSet::append_changed_indices_both(
+       white_ksq, black_ksq, target_state.dirtyPawnPairs, thr_removed[WHITE], thr_added[WHITE],
+       thr_removed[BLACK], thr_added[BLACK], threat_pp_base, pf_stride);
++    RayFeatureSet::append_changed_indices(WHITE, white_ksq, target_state.dirtyRays,
++                                          thr_removed[WHITE], thr_added[WHITE]);
++    RayFeatureSet::append_changed_indices(BLACK, black_ksq, target_state.dirtyRays,
++                                          thr_removed[BLACK], thr_added[BLACK]);
+     PSQFeatureSet::append_changed_indices(WHITE, white_ksq, target_state.dirtyPiece,
+                                           psq_removed[WHITE], psq_added[WHITE]);
+     PSQFeatureSet::append_changed_indices(BLACK, black_ksq, target_state.dirtyPiece,
+@@ -720,6 +728,8 @@ void update_accumulator_hybrid(Color                     perspective,
+                                              thrAdded, threatPpBase, pfStride);
+     PairFeatureSet::append_changed_indices(perspective, newKsq, target.dirtyPawnPairs, thrRemoved,
+                                            thrAdded, threatPpBase, pfStride);
++    RayFeatureSet::append_changed_indices(perspective, newKsq, target.dirtyRays, thrRemoved,
++                                          thrAdded);
+ 
+     const auto& fromAcc = computed.accumulation[perspective];
+     auto&       toAcc   = target.accumulation[perspective];
+@@ -796,6 +806,7 @@ void update_accumulator_refresh_cache(Color                     perspective,
+     ThreatFeatureSet::IndexList active;
+     ThreatFeatureSet::append_active_indices(perspective, pos, active);
+     PairFeatureSet::append_active_indices(perspective, pos, active);
++    RayFeatureSet::append_active_indices(perspective, pos, active);
+ 
+     accumulator.computed[perspective] = true;
+ 
+diff --git a/src/nnue/nnue_architecture.h b/src/nnue/nnue_architecture.h
+index 667ba5e..18dd11f 100644
+--- a/src/nnue/nnue_architecture.h
++++ b/src/nnue/nnue_architecture.h
+@@ -27,6 +27,7 @@
+ #include "features/half_ka_v2_hm.h"
+ #include "features/full_threats.h"
+ #include "features/pp_3wide.h"
++#include "features/ordered_ray_2.h"
+ #include "layers/affine_transform.h"
+ #include "layers/affine_transform_sparse_input.h"
+ #include "layers/clipped_relu.h"
+@@ -39,6 +40,7 @@ namespace Stockfish::Eval::NNUE {
+ // Input features used in evaluation function
+ using ThreatFeatureSet = Features::FullThreats;
+ using PairFeatureSet   = Features::PP_3Wide;
++using RayFeatureSet    = Features::OrderedRay2;
+ using PSQFeatureSet    = Features::HalfKAv2_hm;
+ 
+ // Number of input feature dimensions after conversion
+diff --git a/src/nnue/nnue_feature_transformer.h b/src/nnue/nnue_feature_transformer.h
+index f2af31d..04c7d79 100644
+--- a/src/nnue/nnue_feature_transformer.h
++++ b/src/nnue/nnue_feature_transformer.h
+@@ -88,12 +88,14 @@ class FeatureTransformer {
+     // Number of input/output dimensions
+     static constexpr IndexType ThreatInputDimensions = ThreatFeatureSet::Dimensions;
+     static constexpr IndexType PairInputDimensions   = PairFeatureSet::Dimensions;
++    static constexpr IndexType RayInputDimensions    = RayFeatureSet::Dimensions;
+     static constexpr IndexType PsqDimensions         = PSQFeatureSet::Dimensions;
+-    static constexpr IndexType ThreatAndPpDimensions = ThreatInputDimensions + PairInputDimensions;
++    static constexpr IndexType ThreatAndPpDimensions = ThreatInputDimensions + PairInputDimensions + RayInputDimensions;
+     static constexpr IndexType InputDimensions       = PsqDimensions + ThreatAndPpDimensions;
+     static constexpr IndexType OutputDimensions      = HalfDimensions;
+     static constexpr IndexType ThreatWeightSize      = ThreatInputDimensions * HalfDimensions;
+     static constexpr IndexType PairWeightSize        = PairInputDimensions * HalfDimensions;
++    static constexpr IndexType RayWeightSize         = RayInputDimensions * HalfDimensions;
+     static constexpr IndexType ThreatAndPpWeightSize = ThreatAndPpDimensions * HalfDimensions;
+ 
+     using BiasesArray            = std::array<BiasType, HalfDimensions>;
+@@ -139,7 +141,7 @@ class FeatureTransformer {
+     // Hash value embedded in the evaluation file
+     static constexpr u32 get_hash_value() {
+         return combine_hash(
+-                 {ThreatFeatureSet::HashValue, PairFeatureSet::HashValue, PSQFeatureSet::HashValue})
++                 {ThreatFeatureSet::HashValue, PairFeatureSet::HashValue, RayFeatureSet::HashValue, PSQFeatureSet::HashValue})
+              ^ (OutputDimensions * 2);
+     }
+ 
+@@ -158,6 +160,7 @@ class FeatureTransformer {
+ 
+     ThreatWeightType* threatWeightData() { return threatAndPpWeights.data(); }
+     ThreatWeightType* pawnPairWeightData() { return threatWeightData() + ThreatWeightSize; }
++    ThreatWeightType* rayWeightData() { return pawnPairWeightData() + PairWeightSize; }
+ 
+     // Read network parameters
+     bool read_parameters(std::istream& stream) {
+@@ -165,6 +168,7 @@ class FeatureTransformer {
+ 
+         read_little_endian(stream, threatWeightData(), ThreatWeightSize);
+         read_little_endian(stream, pawnPairWeightData(), PairWeightSize);
++        read_little_endian(stream, rayWeightData(), RayWeightSize);
+ 
+         read_leb_128(stream, weights);
+ 
+@@ -183,6 +187,7 @@ class FeatureTransformer {
+ 
+         write_little_endian(stream, copy->threatWeightData(), ThreatWeightSize);
+         write_little_endian(stream, copy->pawnPairWeightData(), PairWeightSize);
++        write_little_endian(stream, copy->rayWeightData(), RayWeightSize);
+ 
+         write_leb_128<WeightType>(stream, copy->weights);
+ 
+diff --git a/src/position.cpp b/src/position.cpp
+index 4809490..5dc6718 100644
+--- a/src/position.cpp
++++ b/src/position.cpp
+@@ -841,10 +841,12 @@ void Position::do_move(Move                      m,
+ 
+     auto& dpps = dirties.dirtyPawnPairs;
+     auto& dts  = dirties.dirtyThreats;
++    auto& drs  = dirties.dirtyRays;
+     auto& dp   = dirties.dirtyPiece;
+ 
+     dpps.before[WHITE] = pieces(WHITE, PAWN);
+     dpps.before[BLACK] = pieces(BLACK, PAWN);
++    drs.before = piece_array();
+ 
+     Color  us       = sideToMove;
+     Color  them     = ~us;
+@@ -1073,6 +1075,7 @@ void Position::do_move(Move                      m,
+ 
+     dpps.after[WHITE] = pieces(WHITE, PAWN);
+     dpps.after[BLACK] = pieces(BLACK, PAWN);
++    drs.after = piece_array();
+ 
+     assert(dp.pc != NO_PIECE);
+     assert(!(bool(captured) || m.type_of() == CASTLING) ^ (dp.remove_sq != SQ_NONE));
+diff --git a/src/types.h b/src/types.h
+index f51bdb8..92f9653 100644
+--- a/src/types.h
++++ b/src/types.h
+@@ -349,10 +349,16 @@ struct DirtyPawnPairs {
+     Bitboard after[COLOR_NB];
+ };
+ 
++struct DirtyRays {
++    std::array<Piece, SQUARE_NB> before;
++    std::array<Piece, SQUARE_NB> after;
++};
++
+ struct Dirties {
+     DirtyPiece     dirtyPiece;
+     DirtyThreats   dirtyThreats;
+     DirtyPawnPairs dirtyPawnPairs;
++    DirtyRays      dirtyRays;
+ };
+ 
+     #define ENABLE_INCR_OPERATORS_ON(T) \
+
