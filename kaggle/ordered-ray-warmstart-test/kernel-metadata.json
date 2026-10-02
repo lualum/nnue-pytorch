@@ -1,5 +1,5 @@
 {
-  "id": "cogniplayapp/nnue-ordered-ray-warmstart-test",
+  "id": "cogniplayapp/nnue-ordered-ray-warm-start-test",
   "title": "NNUE Ordered Ray Warm-Start Test",
   "code_file": "run.py",
   "language": "python",
