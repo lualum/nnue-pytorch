@@ -32,6 +32,14 @@ run(["git", "checkout", "--detach", EXPERIMENT_COMMIT], cwd=repo)
 run(["git", "rev-parse", "HEAD"], cwd=repo)
 run(["git", "status", "--short"], cwd=repo)
 run([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"], cwd=repo)
+# TensorBoard falls back to its bundled TensorFlow compatibility stub when the
+# optional TensorFlow stack is absent. Kaggle's Python 3.13 image currently
+# ships JAX/TensorFlow builds that require NumPy 2, while nnue-pytorch pins
+# NumPy 1.x, so remove those unused optional packages before training.
+run([
+    sys.executable, "-m", "pip", "uninstall", "-y",
+    "tensorflow", "jax", "jaxlib",
+], cwd=repo)
 
 parent = find_input("baseline.nnue")
 parent_hash = hashlib.sha256(parent.read_bytes()).hexdigest()
