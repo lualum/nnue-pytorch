@@ -51,18 +51,31 @@ def final_metrics(path):
 
 
 def best_validation_checkpoint(version):
-    candidates = []
+    by_epoch = {}
     with (version / "metrics.csv").open(newline="", encoding="utf-8") as source:
         for row in csv.DictReader(source):
-            if row.get("val_loss_epoch") and row.get("epoch"):
-                candidates.append((float(row["val_loss_epoch"]), int(row["epoch"])))
+            if not row.get("epoch"):
+                continue
+            epoch = int(row["epoch"])
+            metrics = by_epoch.setdefault(epoch, {})
+            for key in ("train_loss_epoch", "val_loss_epoch"):
+                if row.get(key):
+                    metrics[key] = float(row[key])
+    candidates = [
+        (metrics["val_loss_epoch"], epoch)
+        for epoch, metrics in by_epoch.items()
+        if "val_loss_epoch" in metrics
+    ]
     if not candidates:
         return version / "checkpoints" / "last.ckpt", final_metrics(version / "metrics.csv")
     val_loss, epoch = min(candidates)
     matches = list((version / "checkpoints").glob(f"epoch={epoch}-step=*.ckpt"))
-    checkpoint = matches[0] if len(matches) == 1 else version / "checkpoints" / "last.ckpt"
-    metrics = final_metrics(version / "metrics.csv")
-    metrics["val_loss_epoch"] = val_loss
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"Best validation epoch {epoch} has {len(matches)} checkpoints: {matches}"
+        )
+    checkpoint = matches[0]
+    metrics = dict(by_epoch[epoch])
     metrics["selected_epoch"] = epoch
     return checkpoint, metrics
 
@@ -131,7 +144,7 @@ def parse_bench(text):
     return {"nodes": nodes, "nps": nps}
 
 
-def parse_match(pgn, candidate="OrderedRay2"):
+def parse_match(pgn, candidate="OrderedRay2", baseline="Baseline"):
     headers = []
     current = {}
     for line in pgn.read_text(encoding="utf-8").splitlines():
@@ -144,22 +157,48 @@ def parse_match(pgn, candidate="OrderedRay2"):
     if current.get("Result"):
         headers.append(current)
 
-    scores = []
+    scored_games = []
     for game in headers:
         result = game["Result"]
         if result == "1/2-1/2":
-            scores.append(0.5)
+            game_score = 0.5
         else:
             candidate_white = game.get("White") == candidate
-            scores.append(float((result == "1-0") == candidate_white))
+            game_score = float((result == "1-0") == candidate_white)
+        round_match = re.fullmatch(r"\d+\.(\d+)", game.get("Round", ""))
+        if not round_match:
+            raise RuntimeError(f"Cannot verify opening pair without c-chess Round: {game}")
+        game_number = int(round_match.group(1))
+        scored_games.append((game_number, game_score, game))
+
+    scored_games.sort(key=lambda item: item[0])
+    scores = [score for _, score, _ in scored_games]
     wins = sum(s == 1 for s in scores)
     draws = sum(s == 0.5 for s in scores)
     losses = sum(s == 0 for s in scores)
-    score = sum(scores) / len(scores)
-    elo = 400 * math.log10(score / (1 - score)) if 0 < score < 1 else math.copysign(math.inf, score - .5)
+    aggregate_score = sum(scores) / len(scores)
+    elo = 400 * math.log10(aggregate_score / (1 - aggregate_score)) if 0 < aggregate_score < 1 else math.copysign(math.inf, aggregate_score - .5)
 
-    # Opening-pair bootstrap preserves the correlation induced by color swaps.
-    pairs = [scores[i:i + 2] for i in range(0, len(scores) - 1, 2)]
+    # Verify c-chess's repeated-opening/color-swap identity instead of assuming
+    # that concurrent completion order implies adjacent pairs.
+    pair_groups = {}
+    for game_number, game_score, game in scored_games:
+        pair_groups.setdefault((game_number - 1) // 2, []).append((game_score, game))
+    pairs = []
+    for pair_id in sorted(pair_groups):
+        pair = pair_groups[pair_id]
+        if len(pair) != 2:
+            raise RuntimeError(f"Opening pair {pair_id} contains {len(pair)} games")
+        first, second = pair[0][1], pair[1][1]
+        if first.get("FEN") != second.get("FEN"):
+            raise RuntimeError(f"Opening pair {pair_id} has mismatched FENs")
+        if not (
+            first.get("White") == second.get("Black")
+            and first.get("Black") == second.get("White")
+            and {first.get("White"), first.get("Black")} == {candidate, baseline}
+        ):
+            raise RuntimeError(f"Opening pair {pair_id} is not a color swap")
+        pairs.append([pair[0][0], pair[1][0]])
     rng = random.Random(20261002)
     samples = []
     for _ in range(20000):
@@ -169,8 +208,10 @@ def parse_match(pgn, candidate="OrderedRay2"):
     samples.sort()
     return {
         "games": len(scores), "wins": wins, "draws": draws, "losses": losses,
-        "score_percent": 100 * score, "elo": elo,
+        "score_percent": 100 * aggregate_score, "elo": elo,
         "elo_95ci": [samples[500], samples[19499]],
+        "opening_pairs": len(pairs),
+        "opening_pair_verification": "Round-grouped; identical FEN and swapped colors",
     }
 
 
@@ -256,6 +297,15 @@ def main():
     candidate_net = output / "candidate.nnue"
     run([sys.executable, "serialize.py", baseline["checkpoint"], baseline_net, "--features", BASELINE_FEATURES], cwd=repo)
     run([sys.executable, "serialize.py", candidate["checkpoint"], candidate_net, "--features", CANDIDATE_FEATURES], cwd=repo)
+    quantization_audit_path = output / "ordered-ray-quantization-audit.json"
+    run([
+        sys.executable, "scripts/audit_ordered_ray_checkpoint.py",
+        "--checkpoint", candidate["checkpoint"],
+        "--reference-model", output / "candidate-ray-warmup-init.pt",
+        "--validation-data", args.validation_data,
+        "--output", quantization_audit_path,
+    ], cwd=repo)
+    quantization_audit = json.loads(quantization_audit_path.read_text())
 
     sf = output / "Stockfish"
     run(["git", "clone", "https://github.com/official-stockfish/Stockfish.git", sf], cwd=output)
@@ -296,9 +346,11 @@ def main():
         "validation_loss_delta": candidate["val_loss_epoch"] - baseline["val_loss_epoch"],
         "bench": {"baseline": baseline_bench, "candidate": candidate_bench, "nps_delta_percent": 100 * (candidate_bench["nps"] / baseline_bench["nps"] - 1)},
         "matches": matches,
+        "ordered_ray_audit": quantization_audit,
         "method": [
             "Both nets start from the same parent network; OrderedRay2 starts at exactly zero contribution.",
-            "Both see the same training positions, optimizer, seed, batch count, and separate held-out validation source.",
+            "Both receive the same 20M-position joint fine-tuning budget, seed, and held-out validation source.",
+            "The candidate additionally receives a 5M-position frozen-backbone ray/gate warmup, so total exposure and update schedules are not identical.",
             "Openings are repeated with colors swapped; equal-node isolates net quality and equal-time includes feature overhead.",
         ],
     }
