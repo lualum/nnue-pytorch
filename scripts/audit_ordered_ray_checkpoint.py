@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 import sys
 
@@ -24,15 +25,21 @@ FEATURES = "Full_Threats+PP_3Wide+OrderedRay2+HalfKAv2_hm^"
 def summary(values: torch.Tensor) -> dict[str, float]:
     values = values.detach().float().cpu().flatten()
     abs_values = values.abs()
+    # torch.quantile has a hard element-count limit. Use a deterministic,
+    # evenly spaced sample for percentiles while retaining exact full-table
+    # mean/std/min/max statistics.
+    stride = max(1, math.ceil(abs_values.numel() / 1_000_000))
+    percentile_sample = abs_values[::stride]
     return {
         "min": values.min().item(),
         "max": values.max().item(),
         "mean": values.mean().item(),
         "std": values.std().item(),
         "abs_mean": abs_values.mean().item(),
-        "abs_p50": abs_values.quantile(0.50).item(),
-        "abs_p90": abs_values.quantile(0.90).item(),
-        "abs_p99": abs_values.quantile(0.99).item(),
+        "abs_p50": percentile_sample.quantile(0.50).item(),
+        "abs_p90": percentile_sample.quantile(0.90).item(),
+        "abs_p99": percentile_sample.quantile(0.99).item(),
+        "percentile_sample_size": percentile_sample.numel(),
     }
 
 
