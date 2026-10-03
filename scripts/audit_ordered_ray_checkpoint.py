@@ -47,6 +47,8 @@ def load_checkpoint(path: Path):
 
 @torch.no_grad()
 def prediction_differences(network, validation_data: Path, batches: int, batch_size: int):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    network.to(device)
     provider = data_loader.SparseBatchProvider(
         FEATURES, [str(validation_data)], batch_size, cyclic=True, num_workers=1
     )
@@ -54,7 +56,7 @@ def prediction_differences(network, validation_data: Path, batches: int, batch_s
     original_gate = ray.gate.detach().clone()
     full_precision, fake_quantized = [], []
     for _ in range(batches):
-        batch = next(provider)
+        batch = tuple(tensor.to(device) for tensor in next(provider))
         us, them, white, black, _, _, piece_count = batch
         ray.gate.copy_(original_gate)
         enabled_fp = network.model(us, them, white, black, piece_count, False, False)
