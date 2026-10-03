@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 
-COMMIT = "ec1588b33ca50fec1a006766cb62dd92a2ba550f"
+COMMIT = "d2d17b5f0ff220414c2d9c31ab2ce181186f0c72"
 
 
 def run(command, cwd=None):
@@ -38,8 +38,9 @@ run([
 run(["cmake", "--build", "build", "-j2"], cwd=repo)
 run([
     sys.executable, "scripts/audit_ordered_ray_checkpoint.py",
-    "--checkpoint", one_suffix("candidate/training_logs/version_0/checkpoints/epoch=3-step=2440.ckpt"),
+    "--checkpoint", one_suffix("candidate_ray_warmup/training_logs/version_0/checkpoints/epoch=0-step=610.ckpt"),
     "--reference-model", one("candidate-ray-warmup-init.pt"),
     "--validation-data", one("dfrc_n5000_piece_0.binpack"),
-    "--output=/kaggle/working/ordered-ray-audit.json",
+    "--output=/kaggle/working/ordered-ray-warmup-audit.json",
+    "--skip-predictions",
 ], cwd=repo)
