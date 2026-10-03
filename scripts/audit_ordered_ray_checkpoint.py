@@ -57,7 +57,11 @@ def prediction_differences(network, validation_data: Path, batches: int, batch_s
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     network.to(device)
     provider = data_loader.SparseBatchProvider(
-        FEATURES, [str(validation_data)], batch_size, cyclic=True, num_workers=1
+        network.model.input_feature_name,
+        [str(validation_data)],
+        batch_size,
+        cyclic=True,
+        num_workers=1,
     )
     ray = network.model.input.features[2]
     original_gate = ray.gate.detach().clone()
