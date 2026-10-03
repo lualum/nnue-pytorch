@@ -104,6 +104,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--batches", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument("--skip-predictions", action="store_true")
     args = parser.parse_args()
 
     network = load_checkpoint(args.checkpoint)
@@ -134,10 +135,11 @@ def main() -> None:
             "fraction_changed": raw_delta.ne(0).float().mean().item(),
             "gate_opened": ray.gate.item() != initial_ray.gate.item(),
         },
-        "prediction_difference_rays_enabled_minus_disabled": prediction_differences(
-            network, args.validation_data, args.batches, args.batch_size
-        ),
     }
+    if not args.skip_predictions:
+        result["prediction_difference_rays_enabled_minus_disabled"] = prediction_differences(
+            network, args.validation_data, args.batches, args.batch_size
+        )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(result, indent=2), flush=True)
