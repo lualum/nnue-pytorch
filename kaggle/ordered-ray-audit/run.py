@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 
-COMMIT = "6a6f291344ef9f43cacd6b04f1d691d82c11f754"
+COMMIT = "f3e1f7de12556d926b629fde354076d39c32ca90"
 
 
 def run(command, cwd=None):
